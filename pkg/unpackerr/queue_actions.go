@@ -97,6 +97,8 @@ func (u *Unpackerr) historyDeleteHandler(response http.ResponseWriter, request *
 	switch err := u.deleteHistoryID(itemID); {
 	case errors.Is(err, errHistoryNotFound):
 		writeJSON(response, http.StatusNotFound, map[string]string{"error": err.Error()})
+	case errors.Is(err, errHistoryInFlight):
+		writeJSON(response, http.StatusConflict, map[string]string{"error": err.Error()})
 	case err != nil:
 		writeJSON(response, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	default:
@@ -143,22 +145,29 @@ func (u *Unpackerr) retryQueueID(itemID string) error {
 	item.Status = WAITING
 	item.Updated = now
 
+	u.notifyQueueLocked()
+
 	return nil
 }
 
+// retryFolderLocked restarts a watched-folder extract as a fresh cycle so the
+// queue/history retry count matches folder.Retries (not leftover auto-retries).
 func (u *Unpackerr) retryFolderLocked(itemID string, item *Extract, now time.Time) error {
 	folder, ok := u.folders.Folders[itemID]
 	if !ok {
 		return errQueueNotFound
 	}
 
-	folder.status = WAITING
-	folder.noRetry = false
-	folder.retries = 0
-	folder.updated = now
+	folder.Status = WAITING
+	folder.NoRetry = false
+	folder.Retries = 0
+	folder.Updated = now
 	item.NoRetry = false
+	item.Retries = 0
 	item.Status = WAITING
 	item.Updated = now
+
+	u.notifyQueueLocked()
 
 	return nil
 }
@@ -175,8 +184,17 @@ func (u *Unpackerr) forgetQueueID(itemID string) error {
 		return errQueueNotFound
 	}
 
-	if !item.Status.isDurableHistory() {
+	if !isDurableHistory(item.Status) {
 		return errQueueNotForgettable
+	}
+
+	if item.Status == DELETED {
+		u.Finished++
+	}
+
+	if item.Status == IMPORTED {
+		u.Printf("[%s] User forgot imported item; skipping file cleanup: %s (%s)",
+			item.Label(), itemID, item.Path)
 	}
 
 	delete(u.Map, itemID)
@@ -190,6 +208,9 @@ func (u *Unpackerr) forgetQueueID(itemID string) error {
 		delete(u.folders.Folders, itemID)
 	}
 
+	u.markHistoryForgotten(itemID)
+	u.notifyQueueLocked()
+
 	return nil
 }
 
@@ -202,9 +223,14 @@ func (u *Unpackerr) sweepForgotten() {
 	u.lockHistory()
 	defer u.unlockHistory()
 
+	if !u.allStarrSnapshotsReady() {
+		// nil Queue is "never polled", not proof the title is gone.
+		return
+	}
+
 	for itemID := range u.forgotten {
-		if u.haveLidarrQitem(itemID) || u.haveRadarrQitem(itemID) ||
-			u.haveReadarrQitem(itemID) || u.haveSonarrQitem(itemID) || u.haveWhisparrQitem(itemID) {
+		if haveStarrQitem(u.Lidarr, itemID) || haveStarrQitem(u.Radarr, itemID) ||
+			haveStarrQitem(u.Readarr, itemID) || haveStarrQitem(u.Sonarr, itemID) {
 			continue
 		}
 

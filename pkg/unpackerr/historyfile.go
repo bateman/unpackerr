@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -19,29 +20,46 @@ const (
 	// historyCompactFactor: rewrite the file once appended lines exceed this
 	// many times keep_history, so the on-disk log stays bounded.
 	historyCompactFactor = 2
+	// historyRestoreAge is how long a JSONL row may sit and still be copied
+	// back into the live queue after a restart.
+	historyRestoreAge = 72 * time.Hour
 )
 
-var errHistoryNotFound = errors.New("not found")
+var (
+	errHistoryNotFound    = errors.New("not found")
+	errHistoryInFlight    = errors.New("item is still in progress")
+	errInterruptedRestart = errors.New("interrupted by restart")
+)
 
-// HistoryRecord is one completed or failed pipeline item (JSONL + API).
+// HistoryRecord is one JSONL row (history API + restart resume).
 type HistoryRecord struct {
-	ID         string        `json:"id"`
-	App        string        `json:"app"`
-	URL        string        `json:"url,omitempty"`
-	Path       string        `json:"path"`
-	OutputPath string        `json:"outputPath,omitempty"`
-	Status     ExtractStatus `json:"status"`
-	Retries    uint          `json:"retries"`
-	Started    time.Time     `json:"started"`
-	Updated    time.Time     `json:"updated"`
-	Finished   time.Time     `json:"finished"`
-	Archives   int           `json:"archives,omitempty"`
-	Files      int           `json:"files,omitempty"`
-	Bytes      uint64        `json:"bytes,omitempty"`
-	Ratio      float64       `json:"ratio,omitempty"`
-	Elapsed    string        `json:"elapsed,omitempty"`
-	Error      string        `json:"error,omitempty"`
-	Progress   string        `json:"progress,omitempty"`
+	ID          string        `json:"id"`
+	App         string        `json:"app"`
+	Kind        string        `json:"kind,omitempty"` // Starr dialect or Folder; App is the instance label.
+	URL         string        `json:"url,omitempty"`
+	Path        string        `json:"path"`
+	OutputPath  string        `json:"outputPath,omitempty"`
+	Status      ExtractStatus `json:"status"`
+	Retries     uint          `json:"retries"`
+	Started     time.Time     `json:"started"`
+	Updated     time.Time     `json:"updated"`
+	Finished    time.Time     `json:"finished,omitzero"`
+	Archives    int           `json:"archives,omitempty"`
+	Files       int           `json:"files,omitempty"`
+	Bytes       uint64        `json:"bytes,omitempty"`
+	Ratio       float64       `json:"ratio,omitempty"`
+	Elapsed     string        `json:"elapsed,omitempty"`
+	Error       string        `json:"error,omitempty"`
+	Progress    string        `json:"progress,omitempty"`
+	DeleteOrig  bool          `json:"deleteOrig,omitempty"`
+	DeleteDelay string        `json:"deleteDelay,omitempty"` // Go duration, e.g. 5m0s
+	Syncthing   bool          `json:"syncthing,omitempty"`
+	SplitFlac   bool          `json:"splitFlac,omitempty"`
+	MaxBytes    uint64        `json:"maxBytes,omitempty"`
+	NoRetry     bool          `json:"noRetry,omitempty"`
+	NewFiles    []string      `json:"newFiles,omitempty"`
+	PreFiles    []string      `json:"preFiles,omitempty"`
+	Forgotten   bool          `json:"forgotten,omitempty"`
 }
 
 // QueueItem is a live in-flight extract for GET /api/queue.
@@ -56,11 +74,33 @@ type QueueItem struct {
 	Updated    time.Time     `json:"updated"`
 	Progress   string        `json:"progress,omitempty"`
 	Error      string        `json:"error,omitempty"`
+	Percent    float64       `json:"percent,omitempty"`
+	Wrote      uint64        `json:"wrote,omitempty"`
+	Total      uint64        `json:"total,omitempty"`
+	Read       uint64        `json:"read,omitempty"`
+	Compressed uint64        `json:"compressed,omitempty"`
+	Files      int           `json:"files,omitempty"`
+	Count      int           `json:"count,omitempty"`
+	Archives   int           `json:"archives,omitempty"`
+	Extracted  int           `json:"extracted,omitempty"`
+	Archive    string        `json:"archive,omitempty"`
 }
 
-func (status ExtractStatus) isDurableHistory() bool {
+func isDurableHistory(status ExtractStatus) bool {
 	switch status {
 	case EXTRACTFAILED, EXTRACTEDNOTHING, IMPORTED, DELETED, DELETEFAILED:
+		return true
+	default:
+		return false
+	}
+}
+
+// isPersistedHistory is written to JSONL so a restart can rebuild the live queue.
+// WAITING is left out; the next Starr poll recreates it.
+func isPersistedHistory(status ExtractStatus) bool {
+	switch status {
+	case QUEUED, EXTRACTING, EXTRACTFAILED, EXTRACTED, IMPORTED,
+		DELETING, DELETEFAILED, DELETED, EXTRACTEDNOTHING:
 		return true
 	default:
 		return false
@@ -173,16 +213,44 @@ func mergeHistory(list []HistoryRecord, recs ...HistoryRecord) []HistoryRecord {
 	return list
 }
 
+// capHistoryLocked trims completed/failed rows to keep_history. In-flight
+// checkpoints sit on top of that cap until they finish, so a small
+// keep_history cannot drop EXTRACTED work a restart would resume.
 func (u *Unpackerr) capHistoryLocked(list []HistoryRecord) []HistoryRecord {
-	if limit := int(u.KeepHistory); limit > 0 && len(list) > limit {
-		return list[len(list)-limit:]
+	limit := int(u.KeepHistory)
+	if limit <= 0 {
+		return list
 	}
 
-	return list
+	durable := 0
+
+	for _, rec := range list {
+		if isDurableHistory(rec.Status) {
+			durable++
+		}
+	}
+
+	if durable <= limit {
+		return list
+	}
+
+	drop := durable - limit
+	out := make([]HistoryRecord, 0, len(list)-drop)
+
+	for _, rec := range list {
+		if drop > 0 && isDurableHistory(rec.Status) {
+			drop--
+			continue
+		}
+
+		out = append(out, rec)
+	}
+
+	return out
 }
 
 func (u *Unpackerr) maybeRecordHistory(itemID string, item *Extract) {
-	if u.KeepHistory == 0 || !item.Status.isDurableHistory() {
+	if u.KeepHistory == 0 || !isPersistedHistory(item.Status) {
 		return
 	}
 
@@ -197,7 +265,8 @@ func historyFromExtract(itemID string, item *Extract) HistoryRecord {
 
 	rec := HistoryRecord{
 		ID:         itemID,
-		App:        string(item.App),
+		App:        item.Label(),
+		Kind:       string(item.App),
 		URL:        item.URL,
 		Path:       item.Path,
 		OutputPath: item.OutputPath,
@@ -205,9 +274,28 @@ func historyFromExtract(itemID string, item *Extract) HistoryRecord {
 		Retries:    item.Retries,
 		Started:    now,
 		Updated:    now,
-		Finished:   now,
+		DeleteOrig: item.DeleteOrig,
+		Syncthing:  item.Syncthing,
+		SplitFlac:  item.SplitFlac,
+		MaxBytes:   item.MaxBytes,
+		NoRetry:    item.NoRetry,
+		PreFiles:   preFileKeys(item.PreFiles),
 	}
 
+	if item.DeleteDelay != 0 {
+		rec.DeleteDelay = item.DeleteDelay.String()
+	}
+
+	if isDurableHistory(item.Status) {
+		rec.Finished = now
+	}
+
+	fillHistoryStats(&rec, item)
+
+	return rec
+}
+
+func fillHistoryStats(rec *HistoryRecord, item *Extract) {
 	if item.XProg != nil {
 		if prog := item.XProg.String(); prog != "no progress yet" {
 			rec.Progress = prog
@@ -218,34 +306,41 @@ func historyFromExtract(itemID string, item *Extract) HistoryRecord {
 		}
 	}
 
-	if item.Resp != nil {
-		if !item.Resp.Started.IsZero() {
-			rec.Started = item.Resp.Started
-		}
-
-		rec.Archives = item.Resp.Archives.Count() + item.Resp.Extras.Count()
-		rec.Files = len(item.Resp.NewFiles)
-		rec.Bytes = item.Resp.Size
-
-		if item.Resp.Elapsed > 0 {
-			rec.Elapsed = item.Resp.Elapsed.Round(time.Second).String()
-		}
-
-		if item.Resp.Error != nil {
-			rec.Error = item.Resp.Error.Error()
-		}
+	if item.Resp == nil {
+		return
 	}
 
-	return rec
+	if !item.Resp.Started.IsZero() {
+		rec.Started = item.Resp.Started
+	}
+
+	rec.Archives = item.Resp.Archives.Count() + item.Resp.Extras.Count()
+	rec.Files = len(item.Resp.NewFiles)
+	rec.Bytes = item.Resp.Size
+	rec.NewFiles = append([]string(nil), item.Resp.NewFiles...)
+
+	if item.Resp.Elapsed > 0 {
+		rec.Elapsed = item.Resp.Elapsed.Round(time.Second).String()
+	}
+
+	if item.Resp.Error != nil {
+		rec.Error = item.Resp.Error.Error()
+	}
 }
 
-// upsertHistory records one durable transition: update memory, append one
+// upsertHistory records one persisted transition: update memory, append one
 // line. The file is compacted only when appends outgrow the cap.
 func (u *Unpackerr) upsertHistory(rec HistoryRecord) {
 	u.histMu.Lock()
 	defer u.histMu.Unlock()
 
 	u.records = u.capHistoryLocked(mergeHistory(u.records, rec))
+	if len(u.records) == 0 {
+		return
+	}
+
+	saved := u.records[len(u.records)-1]
+	u.notifyHistoryLocked(saved)
 
 	if u.histPath == "" {
 		return
@@ -280,6 +375,25 @@ func (u *Unpackerr) upsertHistory(rec HistoryRecord) {
 	u.histLines++
 }
 
+// notifyHistoryLocked pushes UI history. In-flight JSONL rows (extracting,
+// extracted, and similar) stay on disk for restart resume but are not history rows.
+func (u *Unpackerr) notifyHistoryLocked(rec HistoryRecord) {
+	if u.hub == nil {
+		return
+	}
+
+	if isDurableHistory(rec.Status) {
+		row := rec
+		u.hub.notify(topicHistory, historyFrame{Op: "upsert", Row: &row})
+
+		return
+	}
+
+	if rec.ID != "" {
+		u.hub.notify(topicHistory, historyFrame{Op: "delete", ID: rec.ID})
+	}
+}
+
 // compactHistoryLocked rewrites the file from memory: one line per record.
 func (u *Unpackerr) compactHistoryLocked() error {
 	if u.histPath == "" {
@@ -310,9 +424,12 @@ func (u *Unpackerr) historySnapshot() []HistoryRecord {
 	u.histMu.Lock()
 	defer u.histMu.Unlock()
 
-	out := make([]HistoryRecord, len(u.records))
-	for idx := range u.records {
-		out[len(out)-1-idx] = u.records[idx]
+	out := make([]HistoryRecord, 0, len(u.records))
+
+	for _, rec := range slices.Backward(u.records) {
+		if isDurableHistory(rec.Status) {
+			out = append(out, rec)
+		}
 	}
 
 	return out
@@ -322,19 +439,13 @@ func (u *Unpackerr) queueSnapshot() []QueueItem {
 	u.rLockHistory()
 	defer u.rUnlockHistory()
 
-	out := make([]QueueItem, 0, len(u.Map))
-
-	for name, item := range u.Map {
-		out = append(out, queueFromExtract(name, item))
-	}
-
-	return out
+	return u.queueSnapshotLocked()
 }
 
 func queueFromExtract(id string, item *Extract) QueueItem {
 	queue := QueueItem{
 		ID:         id,
-		App:        string(item.App),
+		App:        item.Label(),
 		URL:        item.URL,
 		Path:       item.Path,
 		OutputPath: item.OutputPath,
@@ -343,9 +454,34 @@ func queueFromExtract(id string, item *Extract) QueueItem {
 		Updated:    item.Updated,
 	}
 
+	if item.Status == WAITING && item.App == FolderString {
+		queue.Progress = "last write"
+	}
+
+	if item.Note != "" && queue.Progress == "" {
+		queue.Progress = item.Note
+	}
+
 	if item.XProg != nil {
 		if prog := item.XProg.String(); prog != "no progress yet" {
 			queue.Progress = prog
+		}
+
+		if prog := item.XProg.Progress; prog != nil {
+			queue.Percent = prog.Percent()
+			queue.Wrote = prog.Wrote
+			queue.Total = prog.Total
+			queue.Read = prog.Read
+			queue.Compressed = prog.Compressed
+			queue.Files = prog.Files
+			queue.Count = prog.Count
+			queue.Archives = item.XProg.Archives
+			queue.Extracted = item.XProg.Extracted
+
+			if prog.XFile != nil {
+				rel := strings.TrimPrefix(prog.XFile.FilePath, item.Path)
+				queue.Archive = strings.TrimLeft(filepath.ToSlash(rel), `/\`)
+			}
 		}
 	}
 
@@ -365,16 +501,52 @@ func (u *Unpackerr) deleteHistoryID(itemID string) error {
 		return errHistoryNotFound
 	}
 
+	if !isDurableHistory(u.records[idx].Status) {
+		return errHistoryInFlight
+	}
+
 	u.records = slices.Delete(u.records, idx, idx+1)
 
+	if u.hub != nil {
+		u.hub.notify(topicHistory, historyFrame{Op: "delete", ID: itemID})
+	}
+
 	return u.compactHistoryLocked()
+}
+
+// markHistoryForgotten keeps the history row and flags it so a restart does
+// not restore the item into Map (and re-arm post-import delete).
+func (u *Unpackerr) markHistoryForgotten(itemID string) {
+	if u.KeepHistory == 0 || itemID == "" {
+		return
+	}
+
+	u.histMu.Lock()
+
+	idx := slices.IndexFunc(u.records, func(r HistoryRecord) bool { return r.ID == itemID })
+	if idx < 0 {
+		u.histMu.Unlock()
+		return
+	}
+
+	rec := u.records[idx]
+	u.histMu.Unlock()
+
+	rec.Forgotten = true
+	u.upsertHistory(rec)
 }
 
 func (u *Unpackerr) clearHistory() error {
 	u.histMu.Lock()
 	defer u.histMu.Unlock()
 
-	u.records = nil
+	u.records = slices.DeleteFunc(u.records, func(rec HistoryRecord) bool {
+		return isDurableHistory(rec.Status)
+	})
+
+	if u.hub != nil {
+		u.hub.notify(topicHistory, historyFrame{Op: "clear"})
+	}
 
 	return u.compactHistoryLocked()
 }

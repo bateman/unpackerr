@@ -12,7 +12,7 @@ Three workflows:
 
 Local builds: `make` / `make build`, `make generate`, `make docker`, `make dev`. See the root `Makefile`. Official images copy a prebuilt binary with `init/docker/Dockerfile.goreleaser`; `Dockerfile` at the repo root compiles from source.
 
-`fork.yml` is `workflow_dispatch` plus `v*` tags. It builds `Dockerfile` and pushes `ghcr.io/<owner>/<repo>` (`linux/amd64`, `linux/arm64`). Dispatch can skip the push. Tagged builds also get `latest` plus semver tags. No Apple/Windows signing, packagecloud, or AUR.
+`fork.yml` is `workflow_dispatch` plus `v*` tags. It builds `Dockerfile` and pushes `ghcr.io/<owner>/<repo>` (`linux/arm64` only on this fork, to keep tag builds fast; upstream defaults to `linux/amd64,linux/arm64`). Dispatch can skip the push or pass other platforms. Tagged builds also get `latest` plus semver tags. No Apple/Windows signing, packagecloud, or AUR.
 
 ## Channels
 

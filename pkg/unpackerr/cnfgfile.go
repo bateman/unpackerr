@@ -66,12 +66,16 @@ func (u *Unpackerr) unmarshalConfig() (uint64, uint64, string, error) {
 		msg = msgConfigCreate + u.ConfigFileWithAge()
 	}
 
-	// File snapshot first so UN_* overlays stay on the live Config and never get written back.
+	// File snapshot first so ParseENV overlays onto live only; PUT writes the
+	// request body, not this overlay.
 	u.snapshotFileConfig()
 
-	if _, err := cnfg.UnmarshalENV(u.Config, u.EnvPrefix); err != nil {
+	res, err := cnfg.ParseENV(u.Config, u.EnvPrefix)
+	if err != nil {
 		return 0, 0, msg, fmt.Errorf("environment variables: %w", err)
 	}
+
+	u.envUsed = envSuffixes(res.Used, u.EnvPrefix)
 
 	u.snapshotLivePasswords()
 
@@ -147,17 +151,7 @@ func configFileLocactions() (string, []string) {
 
 // validateConfig makes sure config file values are ok. Returns file and dir modes.
 func (u *Unpackerr) validateConfig() (uint64, uint64) {
-	u.ensureTrayRing()
-
 	return clampConfig(u.Config)
-}
-
-// ensureTrayRing sizes the GUI history ring. This is tray-only; the API and web
-// UI read /api/history instead, so it goes away with the tray history menu.
-func (u *Unpackerr) ensureTrayRing() {
-	if u.KeepHistory != 0 && len(u.Items) == 0 {
-		u.Items = make([]string, min(u.KeepHistory, trayHistory))
-	}
 }
 
 // clampConfig applies minimums and fills defaults for omitted values. It takes a
@@ -168,24 +162,20 @@ func clampConfig(cfg *Config) (uint64, uint64) { //nolint:cyclop
 		cfg.DeleteDelay.Duration = minimumDeleteDelay
 	}
 
-	if _, err := strconv.ParseUint(cfg.LogFileMode, bits8, base32); err != nil || cfg.LogFileMode == "" {
-		cfg.LogFileMode = strconv.FormatUint(defaultLogFileMode, bits8)
-	}
-
-	fileMode, err := strconv.ParseUint(cfg.FileMode, bits8, base32)
-	if err != nil || cfg.FileMode == "" {
-		fileMode = defaultFileMode
-		cfg.FileMode = strconv.FormatUint(fileMode, bits8)
-	}
-
-	dirMode, err := strconv.ParseUint(cfg.DirMode, bits8, base32)
-	if err != nil || cfg.DirMode == "" {
-		dirMode = defaultDirMode
-		cfg.DirMode = strconv.FormatUint(dirMode, bits8)
-	}
+	// Always rewrite so "0644" and "644" compare equal after clamp. The general
+	// form padStarts to four octal digits; FormatUint does not.
+	cfg.LogFileMode = clampUnixMode(cfg.LogFileMode, defaultLogFileMode)
+	fileMode := parseUnixMode(cfg.FileMode, defaultFileMode)
+	cfg.FileMode = strconv.FormatUint(fileMode, bits8)
+	dirMode := parseUnixMode(cfg.DirMode, defaultDirMode)
+	cfg.DirMode = strconv.FormatUint(dirMode, bits8)
 
 	if cfg.Parallel == 0 {
 		cfg.Parallel++
+	}
+
+	if cfg.LogFileMb == 0 {
+		cfg.LogFileMb = defaultLogFileMb
 	}
 
 	if cfg.Progress.Duration == 0 {
@@ -221,6 +211,28 @@ func clampConfig(cfg *Config) (uint64, uint64) { //nolint:cyclop
 	}
 
 	return fileMode, dirMode
+}
+
+func parseUnixMode(raw string, fallback uint64) uint64 {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback
+	}
+
+	mode, err := strconv.ParseUint(raw, bits8, base32)
+	if err != nil {
+		return fallback
+	}
+
+	return mode
+}
+
+func clampUnixMode(raw string, fallback uint64) string {
+	return strconv.FormatUint(parseUnixMode(raw, fallback), bits8)
+}
+
+func sameUnixMode(cur, next string, fallback uint64) bool {
+	return parseUnixMode(cur, fallback) == parseUnixMode(next, fallback)
 }
 
 // createConfigFile attempts to avoid creating a config file on linux or freebsd.
@@ -309,6 +321,52 @@ func (u *Unpackerr) persistConfigFile() {
 
 func (u *Unpackerr) snapshotFileConfig() {
 	u.fileConfig = cloneConfig(u.Config)
+}
+
+// envSuffixes strips the parser prefix so the UI matches envVar="DEBUG" against UN_DEBUG.
+// cnfg joins prefix + "_" + tag, so a prefix that already ends in "_" (APP_)
+// produces APP__DEBUG; we strip that exact prefix and keep the rest as stored
+// (map keys like WEBSERVER_ROLES_stats_PERMISSIONS_0 stay mixed-case).
+func envSuffixes(used cnfg.Pairs, prefix string) map[string]string {
+	out := make(map[string]string, len(used))
+	pfx := prefix + cnfg.LevelSeparator
+
+	for key, val := range used {
+		name := key
+		if prefix != "" {
+			if cut, ok := strings.CutPrefix(key, pfx); ok {
+				name = cut
+			}
+		}
+
+		out[name] = val
+	}
+
+	return out
+}
+
+// envAlwaysRedact is the login secret. GET /api/config/env never returns it,
+// including to callers with *. The UI locks the field from the key being present.
+func envAlwaysRedact(suffix string) bool {
+	return strings.EqualFold(suffix, "WEBSERVER_UI_PASSWORD")
+}
+
+func envValueSecret(suffix string) bool {
+	name := strings.ToUpper(suffix)
+	if strings.Contains(name, "PASSWORD") || strings.Contains(name, "_PASS") ||
+		name == "API_KEY" || strings.HasSuffix(name, "_API_KEY") ||
+		strings.HasSuffix(name, "_TOKEN") {
+		return true
+	}
+
+	_, afterKeys, found := strings.Cut(name, "API_KEYS_")
+	if !found {
+		return false
+	}
+
+	_, after, ok := strings.Cut(afterKeys, "_")
+
+	return ok && after == "KEY"
 }
 
 func (u *Unpackerr) syncFileUIPassword() {
@@ -407,24 +465,17 @@ func expandHomedir(filePath string) string {
 	return expanded
 }
 
-func (u *Unpackerr) validateApp(conf *StarrConfig, app starr.App) error {
-	if conf.URL == "" {
-		u.Errorf("Missing %s URL in one of your configurations, skipped and ignored.", app)
-		return ErrInvalidURL // this error is not printed.
+func (u *Unpackerr) validateApp(conf *StarrConfig, app starr.App, slug string) error {
+	conf.Name = strings.TrimSpace(conf.Name)
+
+	if err := checkStarrName(conf.Name); err != nil {
+		return fmt.Errorf("%s name %q: %w", app, conf.Name, err)
 	}
 
-	if conf.APIKey == "" {
-		u.Errorf("Missing %s API Key in one of your configurations, skipped and ignored.", app)
-		return ErrInvalidURL // this error is not printed.
-	}
+	label := conf.Label(app)
 
-	if !strings.HasPrefix(conf.URL, "http://") && !strings.HasPrefix(conf.URL, "https://") {
-		return fmt.Errorf("%w: (%s) %s", ErrInvalidURL, app, conf.URL)
-	}
-
-	if len(conf.APIKey) < apiKeyMinLength {
-		return fmt.Errorf("%s (%s) %w, your key length: %d",
-			app, conf.URL, ErrInvalidKey, len(conf.APIKey))
+	if err := u.requireStarrAccess(conf, label, slug); err != nil {
+		return err
 	}
 
 	if conf.Timeout.Duration == 0 {
@@ -452,7 +503,7 @@ func (u *Unpackerr) validateApp(conf *StarrConfig, app starr.App) error {
 	}
 
 	if err := conf.applyMaxBytes(app); err != nil {
-		return fmt.Errorf("%s (%s) %w", app, conf.URL, err)
+		return fmt.Errorf("%s (%s) %w", label, conf.URL, err)
 	}
 
 	conf.Client = &http.Client{
@@ -460,6 +511,32 @@ func (u *Unpackerr) validateApp(conf *StarrConfig, app starr.App) error {
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: !conf.ValidSSL}, //nolint:gosec
 		},
+	}
+
+	return nil
+}
+
+func (u *Unpackerr) requireStarrAccess(conf *StarrConfig, label, slug string) error {
+	if conf.URL == "" {
+		u.Errorf("Missing %s URL in instance %q, skipped and ignored.", label, slug)
+		return ErrInvalidURL // this error is not printed.
+	}
+
+	if conf.APIKey == "" {
+		u.Errorf("Missing %s API Key in instance %q, skipped and ignored.", label, slug)
+		return ErrInvalidKey // this error is not printed at startup; PUT returns it.
+	}
+
+	if !strings.HasPrefix(conf.URL, "http://") && !strings.HasPrefix(conf.URL, "https://") {
+		return fmt.Errorf("%w: (%s) %s", ErrInvalidURL, label, conf.URL)
+	}
+
+	if len(conf.APIKey) < apiKeyMinLength {
+		u.Errorf("%s instance %q (%s) API Key is too short (%d < %d), skipped and ignored.",
+			label, slug, conf.URL, len(conf.APIKey), apiKeyMinLength)
+
+		return fmt.Errorf("%s (%s) %w, your key length: %d",
+			label, conf.URL, ErrInvalidKey, len(conf.APIKey))
 	}
 
 	return nil
@@ -475,8 +552,6 @@ func defaultAppMaxBytes(app starr.App) string {
 		return defaultLidarrMaxBytes
 	case starr.Readarr:
 		return defaultReadarrMaxBytes
-	case starr.Whisparr:
-		return defaultWhisparrMaxBytes
 	default:
 		return defaultSonarrMaxBytes
 	}

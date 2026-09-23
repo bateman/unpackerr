@@ -167,6 +167,7 @@ func (u *Unpackerr) retryFolderLocked(itemID string, item *Extract, now time.Tim
 	item.Status = WAITING
 	item.Updated = now
 
+	u.maybeRecordHistory(itemID, item)
 	u.notifyQueueLocked()
 
 	return nil
@@ -197,7 +198,7 @@ func (u *Unpackerr) forgetQueueID(itemID string) error {
 			item.Label(), itemID, item.Path)
 	}
 
-	delete(u.Map, itemID)
+	u.deleteExtract(itemID)
 
 	if item.App != FolderString {
 		u.forgotten[itemID] = struct{}{}

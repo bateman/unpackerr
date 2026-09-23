@@ -127,6 +127,39 @@ export function mergeEnvOnlyRows<T>(
   return extra.length ? [...fileRows, ...extra] : fileRows
 }
 
+export type MapPair = { key: string; value: string }
+
+export function pairsFromMap(m?: Record<string, string> | null): MapPair[] {
+  return Object.entries(m ?? {}).map(([key, value]) => ({ key, value }))
+}
+
+export function mapFromPairs(pairs: MapPair[]): Record<string, string> {
+  const out = Object.create(null) as Record<string, string>
+  for (const p of pairs) {
+    const k = p.key.trim()
+    if (!k) continue
+
+    out[k] = p.value
+  }
+
+  return out
+}
+
+/** True when a saved ids map has an empty, invalid, or case-insensitive duplicate key. */
+export function mapKeysInvalid(m?: Record<string, string> | null): boolean {
+  const seen = new Set<string>()
+  for (const key of Object.keys(m ?? {})) {
+    if (!validSlug(key)) return true
+
+    const lower = key.toLowerCase()
+    if (seen.has(lower)) return true
+
+    seen.add(lower)
+  }
+
+  return false
+}
+
 export const STARR_ENV_FIELDS: Record<string, string> = {
   name: 'NAME',
   url: 'URL',
@@ -149,6 +182,7 @@ export const STARR_ENV_FIELDS: Record<string, string> = {
 
 export const FOLDER_ENV_FIELDS: Record<string, string> = {
   path: 'PATH',
+  interval: 'INTERVAL',
   extract_path: 'EXTRACT_PATH',
   delete_original: 'DELETE_ORIGINAL',
   delete_files: 'DELETE_FILES',
@@ -164,6 +198,8 @@ export const FOLDER_ENV_FIELDS: Record<string, string> = {
   maxFiles: 'MAX_FILES',
   maxRatio: 'MAX_RATIO',
   exclude_paths: 'EXCLUDE_PATH_',
+  wait_extensions: 'WAIT_EXTENSION_',
+  skip_empty: 'SKIP_EMPTY',
 }
 
 export const HOOK_ENV_FIELDS: Record<string, string> = {
@@ -182,4 +218,5 @@ export const HOOK_ENV_FIELDS: Record<string, string> = {
   nickname: 'NICKNAME',
   token: 'TOKEN',
   channel: 'CHANNEL',
+  update: 'UPDATE',
 }

@@ -16,6 +16,7 @@
     ModalHeader,
     Spinner,
     Table,
+    Tooltip,
   } from '@sveltestrap/sveltestrap'
   import { _ } from '../lib/i18n/Translate.svelte'
   import { api } from '../lib/api'
@@ -24,6 +25,7 @@
   import {
     statusColor,
     statusPhrase,
+    errorPhrase,
     bytes,
     dateTime,
     relTime,
@@ -33,13 +35,28 @@
   import { success, failure } from '../lib/toast'
   import type { HistoryRecord } from '../lib/types'
   import { live } from '../lib/socket.svelte'
+  import ItemDetail from '../components/ItemDetail.svelte'
+  import Hint from '../components/Hint.svelte'
+  import InfoIcon from 'phosphor-svelte/lib/Info'
+  import QuestionIcon from 'phosphor-svelte/lib/QuestionIcon'
+  import { theme } from '../lib/theme.svelte'
 
   let { now = Date.now() }: { now?: number } = $props()
+
+  const uid = $props.id()
 
   let filter = $state('')
   let busy = $state<Record<string, boolean>>({})
   let loaded = $state(false)
   let pendingClear = $state(false)
+  let pendingDetail = $state<HistoryRecord | null>(null)
+
+  const detailItem = $derived(
+    pendingDetail
+      ? (live.history.find((row) => row.id === pendingDetail?.id) ??
+          pendingDetail)
+      : null,
+  )
 
   const canWrite = has(systemPerm('history', 'write'))
   const rows = $derived(live.history.filter(isFinishedHistory))
@@ -47,11 +64,23 @@
 
   const shown = $derived(
     filter.trim()
-      ? rows.filter((r) =>
-          (r.id + r.app + r.status)
+      ? rows.filter((r) => {
+          const q = filter.trim().toLowerCase()
+          const errKey = errorPhrase(r.error)
+          return [
+            r.id,
+            r.path,
+            r.app,
+            r.status,
+            $_(statusPhrase(r.status)),
+            r.error,
+            errKey ? $_(errKey) : '',
+          ]
+            .filter(Boolean)
+            .join('\n')
             .toLowerCase()
-            .includes(filter.trim().toLowerCase()),
-        )
+            .includes(q)
+        })
       : rows,
   )
 
@@ -98,7 +127,7 @@
       <Col>
         <CardTitle class="mb-0">{$_('pages.history.Title')}</CardTitle>
       </Col>
-      <Col xs="auto">
+      <Col xs="auto" class="d-flex align-items-center gap-1">
         <Input
           id="history-filter"
           name="history-filter"
@@ -109,6 +138,19 @@
           bind:value={filter}
           style="width: 12rem"
         />
+        <Hint
+          id="{uid}-filter-hint"
+          hint={$_('phrases.FilterHint')}
+          label={$_('phrases.FilterHint')}
+        >
+          <QuestionIcon
+            size="1.15em"
+            class="text-muted"
+            weight="bold"
+            aria-hidden="true"
+            focusable="false"
+          />
+        </Hint>
       </Col>
       <Col xs="auto">
         <ButtonGroup size="sm">
@@ -148,15 +190,15 @@
             <th id="hist-retries" class="text-end" scope="col"
               >{$_('pages.history.Retries')}</th
             >
-            <th id="hist-finished" scope="col">{$_('pages.history.Finished')}</th>
-            {#if canWrite}
-              <th id="hist-actions" class="text-end" scope="col"
-                >{$_('pages.history.Actions')}</th
-              >
-            {/if}
+            <th id="hist-finished" scope="col">
+              {$_('pages.history.Finished')}
+            </th>
+            <th id="hist-actions" class="text-end" scope="col">
+              {$_('pages.history.Actions')}
+            </th>
           </tr>
         </thead>
-        {#each shown as row (row.id)}
+        {#each shown as row, i (row.id)}
           <tbody class="stack-item">
             <tr>
               <td headers="hist-app">{row.app}</td>
@@ -179,24 +221,68 @@
                   ? $_('phrases.Empty')
                   : relTime(row.finished, now)}
               </td>
-              {#if canWrite}
-                <td class="text-end" headers="hist-actions">
+              <td class="text-end" headers="hist-actions">
+                <ButtonGroup size="sm">
                   <Button
+                    id="{uid}-info-{i}"
                     size="sm"
                     color="secondary"
                     outline
-                    disabled={busy[row.id]}
-                    onclick={() => remove(row)}>{$_('buttons.Delete')}</Button
+                    type="button"
+                    aria-label={$_('pages.detail.Info')}
+                    aria-haspopup="dialog"
+                    onclick={() => (pendingDetail = row)}
                   >
-                </td>
-              {/if}
+                    <InfoIcon
+                      size="1.25em"
+                      weight="bold"
+                      aria-hidden="true"
+                      focusable="false"
+                    />
+                  </Button>
+                  {#if canWrite}
+                    <Button
+                      size="sm"
+                      color="secondary"
+                      outline
+                      disabled={busy[row.id]}
+                      onclick={() => remove(row)}>{$_('buttons.Delete')}</Button
+                    >
+                  {/if}
+                </ButtonGroup>
+                <Tooltip
+                  target="{uid}-info-{i}"
+                  placement="left"
+                  theme={theme.tooltip}
+                >
+                  {$_('pages.detail.Info')}
+                </Tooltip>
+              </td>
             </tr>
             <tr class="stack-item-path">
-              <td colspan={canWrite ? 7 : 6} headers="hist-app">
-                <code class="wrap small">{row.id}</code>
-                {#if row.error}<div class="text-danger small">
-                    {row.error}
-                  </div>{/if}
+              <td colspan="7" headers="hist-app">
+                <code class="wrap small">
+                  <button
+                    type="button"
+                    class="queue-path-btn"
+                    title={$_('pages.detail.OpenItem', {
+                      values: { id: row.id },
+                    })}
+                    aria-label={$_('pages.detail.OpenItem', {
+                      values: { id: row.id },
+                    })}
+                    aria-haspopup="dialog"
+                    onclick={() => (pendingDetail = row)}
+                  >
+                    {row.id}
+                  </button>
+                </code>
+                {#if row.error}
+                  {@const errKey = errorPhrase(row.error)}
+                  <div class="text-danger small">
+                    {errKey ? $_(errKey) : row.error}
+                  </div>
+                {/if}
               </td>
             </tr>
           </tbody>
@@ -207,9 +293,9 @@
 </Card>
 
 <Modal isOpen={pendingClear} toggle={cancelClear}>
-  <ModalHeader toggle={cancelClear}
-    >{$_('phrases.ClearHistoryTitle')}</ModalHeader
-  >
+  <ModalHeader toggle={cancelClear}>
+    {$_('phrases.ClearHistoryTitle')}
+  </ModalHeader>
   <ModalBody>{$_('phrases.ClearHistoryConfirm')}</ModalBody>
   <ModalFooter>
     <Button color="secondary" type="button" onclick={cancelClear}
@@ -220,3 +306,5 @@
     >
   </ModalFooter>
 </Modal>
+
+<ItemDetail item={detailItem} {now} onclose={() => (pendingDetail = null)} />

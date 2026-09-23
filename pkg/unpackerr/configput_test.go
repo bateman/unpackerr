@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"golift.io/cnfg"
 	"golift.io/starr/sonarr"
 )
@@ -461,7 +462,7 @@ func TestConfigPutFoldersValidationDoesNotApply(t *testing.T) {
 	unpack.snapshotFileConfig()
 	key := putKey(unpack)
 
-	body := `{"interval":"1s","buffer":1000,"folder":[{"path":"/rejected/path","maxBytes":"bogus"}]}`
+	body := `{"buffer":1000,"folder":[{"path":"/rejected/path","maxBytes":"bogus"}]}`
 	if rec := doAuth(t, unpack, http.MethodPut, "/api/config/folders", body, key); rec.Code != http.StatusBadRequest {
 		t.Fatalf("bogus folder %d %s", rec.Code, rec.Body.String())
 	}
@@ -474,7 +475,7 @@ func TestConfigPutFoldersValidationDoesNotApply(t *testing.T) {
 		t.Fatalf("rejected folder staged: %+v", unpack.fileConfig.Folders)
 	}
 
-	emptyPath := `{"interval":"1s","buffer":1000,"folder":{"foo2":{"delete_original":true}}}`
+	emptyPath := `{"buffer":1000,"folder":{"foo2":{"delete_original":true}}}`
 	if rec := doAuth(t, unpack, http.MethodPut, "/api/config/folders", emptyPath, key); rec.Code != http.StatusBadRequest {
 		t.Fatalf("empty folder path %d %s", rec.Code, rec.Body.String())
 	}
@@ -495,6 +496,45 @@ func TestConfigPutWebhooksValidationDoesNotApply(t *testing.T) {
 
 	if len(unpack.Webhook) != 0 {
 		t.Fatalf("rejected webhooks went live: %+v", unpack.Webhook)
+	}
+}
+
+func TestConfigPutWebhookRewritesNotifiarrURL(t *testing.T) {
+	t.Parallel()
+
+	const key = "00000000-0000-4000-8000-000000000000"
+
+	unpack := testAuthUnpackerr(t)
+	unpack.ConfigFile = filepath.Join(t.TempDir(), "unpackerr.conf")
+	unpack.snapshotFileConfig()
+
+	legacy := "https://notifiarr.com/api/v1/notification/unpackerr/" + key
+	body := `{"notifiarr":{"name":"Notifiarr","url":"` + legacy + `"}}`
+
+	rec := doAuth(t, unpack, http.MethodPut, "/api/config/webhooks", body, putKey(unpack))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("put %d %s", rec.Code, rec.Body.String())
+	}
+
+	wantURL := "https://notifiarr.com/api/v1/notification/unpackerr"
+	check := func(got *WebhookConfig) {
+		t.Helper()
+
+		if got == nil || got.URL != wantURL || got.Headers["X-Api-Key"] != key {
+			t.Fatalf("webhook %+v", got)
+		}
+	}
+
+	check(unpack.fileConfig.Webhook["notifiarr"])
+	check(unpack.Webhook["notifiarr"])
+
+	written, err := os.ReadFile(unpack.ConfigFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if strings.Contains(string(written), "/unpackerr/"+key) {
+		t.Fatalf("path key written:\n%s", written)
 	}
 }
 
@@ -1367,7 +1407,7 @@ func TestConfigPutSetsPendingRestart(t *testing.T) {
 	}
 
 	folders, err := json.Marshal(map[string]any{
-		"interval": "1s", "buffer": 1000, "folder": []map[string]string{{"path": t.TempDir()}},
+		"buffer": 1000, "folder": []map[string]string{{"path": t.TempDir()}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1624,7 +1664,7 @@ func TestConfigPutWriteFailureDoesNotArmRestart(t *testing.T) {
 	unpack.ConfigFile = blockedPath(t, "unpackerr.conf")
 
 	folders, err := json.Marshal(map[string]any{
-		"interval": "1s", "buffer": 1000, "folder": []map[string]string{{"path": t.TempDir()}},
+		"buffer": 1000, "folder": []map[string]string{{"path": t.TempDir()}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1894,6 +1934,39 @@ func TestConfigGetLiveRedactsInstanceSecrets(t *testing.T) {
 	}
 }
 
+func TestConfigGetLiveRedactsHookHeaders(t *testing.T) {
+	t.Parallel()
+
+	unpack := testAuthUnpackerr(t)
+	unpack.Webhook = InstanceMap[WebhookConfig]{
+		"discord": {
+			URL:  "http://hooks.example/discord",
+			Name: "discord",
+			Headers: map[string]string{
+				"Authorization": "Bearer header-secret",
+				"Title":         "Unpackerr",
+			},
+		},
+	}
+	unpack.snapshotFileConfig()
+
+	key := putKey(unpack)
+
+	live := doAuth(t, unpack, http.MethodGet, "/api/config/webhooks/live", "", key)
+	if live.Code != http.StatusOK {
+		t.Fatalf("live %d %s", live.Code, live.Body.String())
+	}
+
+	if strings.Contains(live.Body.String(), "header-secret") {
+		t.Fatalf("live GET leaked header secret: %s", live.Body.String())
+	}
+
+	file := doAuth(t, unpack, http.MethodGet, "/api/config/webhooks", "", key)
+	if file.Code != http.StatusOK || !strings.Contains(file.Body.String(), "header-secret") {
+		t.Fatalf("file GET %d %s", file.Code, file.Body.String())
+	}
+}
+
 func envWebhookUnpackerr(t *testing.T, envURL, envSecret string) *Unpackerr {
 	t.Helper()
 
@@ -2042,8 +2115,7 @@ func TestConfigPutFoldersKeepsEnvExtractPath(t *testing.T) {
 	}
 
 	body, err := json.Marshal(map[string]any{
-		"interval": "2s",
-		"buffer":   1000,
+		"buffer": 1000,
 		"folder": map[string]any{
 			"watch": map[string]any{
 				"path":         setup.watch,
@@ -2116,8 +2188,7 @@ func TestConfigPutFoldersKeepsSiblingExcludePaths(t *testing.T) {
 	setup := envFolderExcludeUnpackerr(t)
 
 	body, err := json.Marshal(map[string]any{
-		"interval": "2s",
-		"buffer":   1000,
+		"buffer": 1000,
 		"folder": map[string]any{
 			"watch": map[string]any{
 				"path":          setup.watch,
@@ -2163,8 +2234,7 @@ func TestConfigPutFoldersOtherSlugWhenEnvHasNoPath(t *testing.T) {
 	watch := t.TempDir()
 
 	body, err := json.Marshal(map[string]any{
-		"interval": "1s",
-		"buffer":   1000,
+		"buffer": 1000,
 		"folder": map[string]any{
 			"tv": map[string]any{"path": watch},
 		},
@@ -2351,5 +2421,68 @@ func TestConfigPutSonarrOtherSlugWhenEnvURLHasNoKey(t *testing.T) {
 	got := unpack.Sonarr["1"]
 	if got == nil || got.URL != "http://sonarr-uhd:8989" || got.APIKey != otherKey {
 		t.Fatalf("live slug 1 %+v", got)
+	}
+}
+
+func TestConfigPutHooksPayload(t *testing.T) {
+	t.Parallel()
+
+	unpack := testAuthUnpackerr(t)
+	unpack.ConfigFile = filepath.Join(t.TempDir(), "unpackerr.conf")
+	unpack.snapshotFileConfig()
+
+	empty := doAuth(t, unpack, http.MethodPut, "/api/config/hooks", `{}`, putKey(unpack))
+	if empty.Code != http.StatusOK {
+		t.Fatalf("empty put %d %s", empty.Code, empty.Body.String())
+	}
+
+	body := `{"customIDs":{"url":"https://unpackerr.example"},"titles":{"extracting":"Archive Found"}}`
+
+	put := doAuth(t, unpack, http.MethodPut, "/api/config/hooks", body, putKey(unpack))
+	if put.Code != http.StatusOK {
+		t.Fatalf("put %d %s", put.Code, put.Body.String())
+	}
+
+	if unpack.Hooks.CustomIDs["url"] != "https://unpackerr.example" ||
+		unpack.Hooks.Titles.Extracting != "Archive Found" {
+		t.Fatalf("live %+v", unpack.Hooks)
+	}
+
+	written, err := os.ReadFile(unpack.ConfigFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	text := string(written)
+	if strings.Contains(text, "custom_ids =") || strings.Contains(text, "titles = {") ||
+		strings.Contains(text, "custom_ids = url") || strings.Contains(text, "titles = extracting") {
+		t.Fatalf("string maps wrote assignments:\n%s", text)
+	}
+
+	if !strings.Contains(text, "[hooks.custom_ids]") || !strings.Contains(text, "[hooks.titles]") {
+		t.Fatalf("missing nested hook tables:\n%s", text)
+	}
+
+	parsed := struct {
+		Hooks HooksConfig `toml:"hooks"`
+	}{}
+	if err := toml.Unmarshal(written, &parsed); err != nil {
+		t.Fatalf("written TOML: %v\n%s", err, text)
+	}
+
+	if parsed.Hooks.CustomIDs["url"] != "https://unpackerr.example" ||
+		parsed.Hooks.Titles.Extracting != "Archive Found" {
+		t.Fatalf("file hooks %+v", parsed.Hooks)
+	}
+
+	got := doAuth(t, unpack, http.MethodGet, "/api/config/hooks", "", putKey(unpack))
+	if got.Code != http.StatusOK || !strings.Contains(got.Body.String(), "Archive Found") {
+		t.Fatalf("get %d %s", got.Code, got.Body.String())
+	}
+
+	bad := doAuth(t, unpack, http.MethodPut, "/api/config/hooks",
+		`{"titles":{"nope":"x"}}`, putKey(unpack))
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("unknown title field %d %s", bad.Code, bad.Body.String())
 	}
 }

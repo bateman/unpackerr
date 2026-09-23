@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/Unpackerr/unpackerr/pkg/hooks"
 	"golift.io/cnfg"
 	"golift.io/cnfgfile"
 	"golift.io/starr"
@@ -96,12 +97,16 @@ func (u *Unpackerr) replaceConfigSection(section ConfigSection, raw json.RawMess
 			func(c *Config) *InstanceMap[ReadarrConfig] { return &c.Readarr })
 	case SectionFolders:
 		return u.putFolders(raw)
+	case SectionHooks:
+		return false, u.putHooksConfig(raw)
 	case SectionWebhooks:
 		return false, u.putHooks(raw, u.validateWebhookList,
-			func(c *Config) *InstanceMap[WebhookConfig] { return &c.Webhook })
+			func(c *Config) *InstanceMap[WebhookConfig] { return &c.Webhook },
+			hooks.NormalizeNotifiarr)
 	case SectionCmdhooks:
 		return false, u.putHooks(raw, u.validateCmdhookList,
-			func(c *Config) *InstanceMap[WebhookConfig] { return &c.Cmdhook })
+			func(c *Config) *InstanceMap[WebhookConfig] { return &c.Cmdhook },
+			nil)
 	default:
 		return false, fmt.Errorf("%w: %s", errUnknownSection, section)
 	}
@@ -641,6 +646,36 @@ func putStarrList[T any, P starrApp[T]](
 	})
 }
 
+func (u *Unpackerr) putHooksConfig(raw json.RawMessage) error {
+	var next HooksConfig
+	if err := unmarshalStrict(raw, &next); err != nil {
+		return err
+	}
+
+	if err := validateHooksConfig(&next); err != nil {
+		return err
+	}
+
+	file := cloneHooks(next)
+
+	preview, err := u.applyEnvOverlay(func(cfg *Config) {
+		cfg.Hooks = cloneHooks(next)
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := validateHooksConfig(&preview.Hooks); err != nil {
+		return err
+	}
+
+	return u.commitConfig(func(cfg *Config) {
+		cfg.Hooks = file
+	}, func() {
+		u.Hooks = cloneHooks(preview.Hooks)
+	})
+}
+
 func starrIdentity(conf *StarrConfig) string {
 	return conf.URL + "\x00" + conf.APIKey
 }
@@ -687,7 +722,6 @@ func (u *Unpackerr) putFolders(raw json.RawMessage) (bool, error) {
 	fileList := cloneFolderMap(next.Folder)
 
 	preview, err := u.applyEnvOverlay(func(cfg *Config) {
-		cfg.Folder.Interval = next.Interval
 		cfg.Folder.Buffer = next.Buffer
 		cfg.Folders = cloneFolderMap(next.Folder)
 	})
@@ -707,11 +741,9 @@ func (u *Unpackerr) putFolders(raw json.RawMessage) (bool, error) {
 
 	// The fsnotify watcher is built once at startup; the new list needs a restart.
 	return true, u.commitConfig(func(cfg *Config) {
-		cfg.Folder.Interval = next.Interval
 		cfg.Folder.Buffer = next.Buffer
 		cfg.Folders = fileList
 	}, func() {
-		u.Folder.Interval = preview.Folder.Interval
 		u.Folder.Buffer = preview.Folder.Buffer
 		u.Folders = preview.Folders
 	})
@@ -721,10 +753,17 @@ func (u *Unpackerr) putHooks(
 	raw json.RawMessage,
 	validate func(InstanceMap[WebhookConfig]) error,
 	field func(*Config) *InstanceMap[WebhookConfig],
+	normalize func(*hooks.Config),
 ) error {
 	var list InstanceMap[WebhookConfig]
 	if err := unmarshalInstances(raw, &list); err != nil {
 		return err
+	}
+
+	if normalize != nil {
+		for _, hook := range list {
+			normalize(hook)
+		}
 	}
 
 	fileList := cloneHookMap(list)

@@ -415,6 +415,17 @@ func TestConfigTOMLTagsInSchema(t *testing.T) {
 	skip := map[string]struct{}{
 		"path": {}, // legacy StarrConfig alias for paths
 		"key":  {}, // nested [[webserver.api_keys]]; parent api_keys is in the schema
+		// nested [hooks.titles]; parent titles is in the schema
+		"waiting":          {},
+		"queued":           {},
+		"extracting":       {},
+		"extractfailed":    {},
+		"extracted":        {},
+		"imported":         {},
+		"deleting":         {},
+		"deletefailed":     {},
+		"deleted":          {},
+		"extractednothing": {},
 	}
 
 	missing := missingSchemaTags(reflect.TypeFor[Config](), schema.ParamNames(), skip)
@@ -612,10 +623,10 @@ func TestWriteConfigFileFullRoundTrip(t *testing.T) { //nolint:funlen // one fie
 	unpack.Lidarr = instanceMap([]*LidarrConfig{{StarrConfig: starrConf("http://lidarr:8686"), SplitFlac: true}})
 	unpack.Readarr = instanceMap([]*ReadarrConfig{{StarrConfig: starrConf("http://readarr:8787")}})
 	unpack.Readarr["0"].APIKey = starrKey
-	unpack.Folder.Interval = cnfg.Duration{Duration: 4 * time.Second}
 	unpack.Folder.Buffer = 5000
 	unpack.Folders = instanceMap([]*FolderConfig{{
 		Path: "/watch", ExtractPath: "/extracted", DeleteOrig: true, MoveBack: true, ExtractISOs: true,
+		Interval:    cnfg.Duration{Duration: 4 * time.Second},
 		DeleteAfter: &cnfg.Duration{Duration: 11 * time.Minute}, MaxNested: 2, MaxFiles: 99, MaxRatio: 3.5,
 		ExcludePaths: []string{"/watch/skip"},
 	}})
@@ -723,6 +734,31 @@ func TestEnvSuffixesAndSecrets(t *testing.T) {
 
 	if envAlwaysRedact("SONARR_0_API_KEY") {
 		t.Fatal("starr keys stay visible to * via env GET")
+	}
+}
+
+func TestEnvValueSecretHookHeaders(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{
+		"WEBHOOK_discord_HEADERS_Authorization",
+		"WEBHOOK_0_HEADERS_CF-Access-Client-Secret",
+		"WEBHOOK_ntfy_HEADERS_X-Api-Key",
+		"CMDHOOK_echo_HEADERS_Cookie",
+	} {
+		if !envValueSecret(name) {
+			t.Fatalf("expected secret %s", name)
+		}
+	}
+
+	for _, name := range []string{
+		"WEBHOOK_discord_HEADERS_Title",
+		"WEBHOOK_discord_HEADERS_CF-Access-Client-Id",
+		"WEBSERVER_SSL_KEY_FILE",
+	} {
+		if envValueSecret(name) {
+			t.Fatalf("unexpected secret %s", name)
+		}
 	}
 }
 

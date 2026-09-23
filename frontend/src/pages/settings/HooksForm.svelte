@@ -6,6 +6,7 @@
     CardBody,
     CardHeader,
     Col,
+    Collapse,
     FormCheck,
     FormGroup,
     FormText,
@@ -16,9 +17,12 @@
     ModalHeader,
     Row,
     Spinner,
+    Badge,
   } from '@sveltestrap/sveltestrap'
   import Input from '../../components/Input.svelte'
+  import MapPairs from '../../components/MapPairs.svelte'
   import SaveBar from '../../components/SaveBar.svelte'
+  import CreateTemplate from '../../components/fileBrowser/CreateTemplate.svelte'
   import { _ } from '../../lib/i18n/Translate.svelte'
   import {
     loadSection,
@@ -27,7 +31,7 @@
     testSection,
   } from '../../lib/config'
   import { has } from '../../lib/auth.svelte'
-  import { configPerm } from '../../lib/perms'
+  import { configPerm, systemPerm } from '../../lib/perms'
   import {
     EXTRACT_STATUSES,
     type ConfigSection,
@@ -46,9 +50,25 @@
   import { failure } from '../../lib/toast'
   import { envHas } from '../../lib/env.svelte'
   import {
+    HOOK_TEMPLATE_NAMES,
+    NOTIFIARR_API_KEY_HEADER,
+    applyNotifiarrURL,
+    headerValue,
+    hookFormProfile,
+    hookShowsApiKey,
+    hookShowsField,
+    hookShowsHeaders,
+    omitHeader,
+    rewriteNotifiarrURL,
+    setHeader,
+    type DetectedHookTemplate,
+    type HookFormProfile,
+  } from '../../lib/hooktmpl'
+  import {
     envField,
     HOOK_ENV_FIELDS,
     instanceMap,
+    mapKeysInvalid,
     mergeEnvOnlyRows,
     newRow,
     omitEnvFields,
@@ -73,8 +93,15 @@
   let testError = $state('')
   let testElapsed = $state('')
   let testResult = $state<HookTestResult | null>(null)
+  let createRow = $state<InstanceRow<WebhookConfig> | null>(null)
+  let guideOpen = $state(false)
+  let guidePick = $state<DetectedHookTemplate>('notifiarr')
+  let advancedOpen = $state<Record<string, boolean>>({})
 
   const canWrite = $derived(has(configPerm(section, 'write')))
+  const canCreateTemplate = $derived(
+    canWrite && has(systemPerm('browse', 'write')),
+  )
   const envPrefix = $derived(isCmd ? 'CMDHOOK' : 'WEBHOOK')
   const idField = $derived(isCmd ? 'COMMAND' : 'URL')
   const invalid = $derived(
@@ -87,6 +114,7 @@
       if (slugError(row.slug) || slugDuplicateError(row.slug, others))
         return true
       if (envHas(envField(envPrefix, row.slug, idField))) return false
+      if (!isCmd && mapKeysInvalid(row.value.headers)) return true
       return isCmd
         ? !!requiredCommandError(row.value.command)
         : !!httpURLError(row.value.url)
@@ -156,13 +184,23 @@
 
   const templateChoices = $derived([
     { value: '', name: $_('config.hooks.template.auto') },
-    { value: 'notifiarr', name: 'notifiarr' },
-    { value: 'discord', name: 'discord' },
-    { value: 'gotify', name: 'gotify' },
-    { value: 'pushover', name: 'pushover' },
-    { value: 'slack', name: 'slack' },
-    { value: 'telegram', name: 'telegram' },
+    ...HOOK_TEMPLATE_NAMES.map((name) => ({
+      value: name,
+      name: i18nOr('config.hooks.profile.' + name, name),
+    })),
   ])
+
+  const GUIDE_TEMPLATES: readonly DetectedHookTemplate[] = [
+    ...HOOK_TEMPLATE_NAMES,
+    'custom',
+  ]
+
+  const guideChoices = $derived(
+    GUIDE_TEMPLATES.map((name) => ({
+      value: name,
+      name: i18nOr('config.hooks.profile.' + name, name),
+    })),
+  )
 
   function blank(): WebhookConfig {
     return {
@@ -181,23 +219,75 @@
       nickname: '',
       token: '',
       channel: '',
+      update: true,
+      headers: {},
     }
   }
 
   function normalizeHook(
     h: Partial<WebhookConfig> | null | undefined,
   ): WebhookConfig {
+    const headers = { ...(h?.headers ?? {}) }
+    const applied = applyNotifiarrURL(h?.url ?? '', headers)
     return {
       ...blank(),
       ...h,
       timeout: explicitTimeout(h?.timeout),
       events: Array.isArray(h?.events) ? [...h.events] : [],
       exclude: Array.isArray(h?.exclude) ? [...h.exclude] : [],
+      url: applied.url,
+      headers: applied.headers,
+      update: h?.update ?? true,
     }
   }
 
+  function setUrl(row: InstanceRow<WebhookConfig>, raw: string) {
+    const wasNotifiarr = hookShowsApiKey(row.value.url)
+    const rewritten = rewriteNotifiarrURL(raw)
+    let headers = { ...(row.value.headers ?? {}) }
+    if (rewritten.apiKey) {
+      headers = setHeader(headers, NOTIFIARR_API_KEY_HEADER, rewritten.apiKey)
+    }
+    row.value.url = rewritten.url
+    row.value.headers = headers
+    if (wasNotifiarr && !hookShowsApiKey(rewritten.url)) {
+      row.value.headers = omitHeader(row.value.headers, NOTIFIARR_API_KEY_HEADER)
+    }
+  }
+
+  function apiKeyOf(hook: WebhookConfig): string {
+    return headerValue(hook.headers, NOTIFIARR_API_KEY_HEADER)
+  }
+
+  function setApiKey(hook: WebhookConfig, raw: string) {
+    const value = String(raw ?? '')
+    hook.headers = value
+      ? setHeader(hook.headers, NOTIFIARR_API_KEY_HEADER, value)
+      : omitHeader(hook.headers, NOTIFIARR_API_KEY_HEADER)
+  }
+
+  function extraHeaders(hook: WebhookConfig): Record<string, string> {
+    return hookShowsApiKey(hook.url)
+      ? omitHeader(hook.headers, NOTIFIARR_API_KEY_HEADER)
+      : (hook.headers ?? {})
+  }
+
+  function setExtraHeaders(hook: WebhookConfig, values: Record<string, string>) {
+    if (!hookShowsApiKey(hook.url)) {
+      hook.headers = values
+      return
+    }
+    const key = apiKeyOf(hook)
+    hook.headers = key
+      ? setHeader(values, NOTIFIARR_API_KEY_HEADER, key)
+      : omitHeader(values, NOTIFIARR_API_KEY_HEADER)
+  }
+
   function taken(row: InstanceRow<WebhookConfig>): string[] {
-    return rows.filter((r) => r.id !== row.id).map((r) => r.slug).filter(Boolean)
+    return rows
+      .filter((r) => r.id !== row.id)
+      .map((r) => r.slug)
+      .filter(Boolean)
   }
 
   function setName(row: InstanceRow<WebhookConfig>, name: string) {
@@ -225,14 +315,22 @@
     const out: Record<string, WebhookConfig> = {}
     for (const row of rows) {
       if (row.envOnly || !row.slug) continue
-      out[row.slug] = omitEnvFields(
-        envPrefix,
-        row.slug,
-        row.value,
-        HOOK_ENV_FIELDS,
+      let hook = omitHiddenContentType(
+        omitEnvFields(envPrefix, row.slug, row.value, HOOK_ENV_FIELDS),
       )
+      if (isCmd) {
+        hook = { ...hook, headers: undefined }
+      }
+      out[row.slug] = hook
     }
     return out
+  }
+
+  // Built-ins set Content-Type themselves. Sending the form's json default
+  // would skip the Pushover form-urlencoded default on save and test.
+  function omitHiddenContentType(hook: WebhookConfig): WebhookConfig {
+    if (isCmd || hookShowsField(profileOf(hook), 'contentType')) return hook
+    return { ...hook, contentType: '' }
   }
 
   function eventOn(
@@ -326,11 +424,7 @@
   function dialectOn(hook: WebhookConfig, dialect: string): boolean {
     return excludeHas(hook, dialect)
   }
-  function nameOn(
-    hook: WebhookConfig,
-    dialect: string,
-    name: string,
-  ): boolean {
+  function nameOn(hook: WebhookConfig, dialect: string, name: string): boolean {
     return dialectOn(hook, dialect) || excludeHas(hook, name)
   }
   function setExclude(hook: WebhookConfig, remove: string[], add: string[]) {
@@ -437,7 +531,7 @@
       url: hook.url,
       command: hook.command,
       token: hook.token,
-      contentType: hook.contentType,
+      contentType: omitHiddenContentType(hook).contentType,
       template: hook.template,
       templatePath: hook.templatePath,
       timeout: hook.timeout,
@@ -446,6 +540,10 @@
       nickname: hook.nickname,
       channel: hook.channel,
       name: hook.name,
+      headers:
+        isCmd || envHas(envField(envPrefix, row.slug, 'HEADERS_*'))
+          ? undefined
+          : (hook.headers ?? {}),
       event: testEvent,
       app: testApp,
     })
@@ -457,6 +555,103 @@
       return
     }
     testResult = res.body
+  }
+
+  function closeCreate() {
+    createRow = null
+  }
+
+  function createdTemplate(path: string) {
+    if (createRow) {
+      createRow.value.templatePath = path
+      createRow.value.template = ''
+    }
+    createRow = null
+  }
+
+  function profileOf(hook: WebhookConfig): HookFormProfile {
+    return hookFormProfile(hook.template, hook.url, hook.templatePath)
+  }
+
+  function i18nOr(key: string, fallback: string): string {
+    const text = $_(key)
+    return text && text !== key ? text : fallback
+  }
+
+  function hookFieldText(
+    template: DetectedHookTemplate,
+    field: string,
+    part: 'label' | 'description' | 'tooltip',
+  ): string {
+    const specificKey = 'config.hooks.' + field + '.' + template + '.' + part
+    const specific = $_(specificKey)
+    if (specific && specific !== specificKey) return specific
+    return i18nOr('config.hooks.' + field + '.' + part, '')
+  }
+
+  function guideTitle(template: DetectedHookTemplate): string {
+    const name = i18nOr('config.hooks.profile.' + template, template)
+    return $_('config.hooks.guide.title', { values: { name } })
+  }
+
+  function guideParagraphs(template: DetectedHookTemplate): string[] {
+    const key = 'config.hooks.guide.' + template
+    const text = $_(key)
+    if (!text || text === key) return []
+    return text
+      .trim()
+      .split(/\n\s*\n/)
+      .map((p) => p.replace(/[ \t]*\n[ \t]*/g, ' ').trim())
+      .filter(Boolean)
+  }
+
+  function inlineParts(text: string): { code: boolean; text: string }[] {
+    return text.split('`').map((bit, i) => ({
+      code: i % 2 === 1,
+      text: bit,
+    }))
+  }
+
+  function profileChip(profile: HookFormProfile): string {
+    const name = i18nOr(
+      'config.hooks.profile.' + profile.template,
+      profile.template,
+    )
+    if (profile.source === 'url') {
+      return $_('config.hooks.chip.fromURL', { values: { name } })
+    }
+    if (profile.source === 'named') {
+      return $_('config.hooks.chip.named', { values: { name } })
+    }
+    if (profile.source === 'file') {
+      return $_('config.hooks.chip.custom')
+    }
+    return $_('config.hooks.chip.default')
+  }
+
+  function advancedDefault(hook: WebhookConfig): boolean {
+    return (
+      !!(hook.template ?? '').trim() ||
+      !!(hook.templatePath ?? '').trim() ||
+      Object.keys(extraHeaders(hook)).length > 0
+    )
+  }
+
+  function isAdvancedOpen(row: InstanceRow<WebhookConfig>): boolean {
+    return advancedOpen[row.id] ?? advancedDefault(row.value)
+  }
+
+  function toggleAdvanced(row: InstanceRow<WebhookConfig>) {
+    advancedOpen[row.id] = !isAdvancedOpen(row)
+  }
+
+  function closeGuide() {
+    guideOpen = false
+  }
+
+  function openGuide(row: InstanceRow<WebhookConfig>) {
+    guidePick = profileOf(row.value).template
+    guideOpen = true
   }
 </script>
 
@@ -476,6 +671,7 @@
     {@const slug = row.slug}
     {@const prev = orig[slug]}
     {@const envOnly = row.envOnly}
+    {@const profile = profileOf(hook)}
     <Card class="mb-3">
       <CardHeader>
         <Row class="align-items-center">
@@ -527,18 +723,6 @@
                 envVar={envField(envPrefix, slug, 'NAME')}
               />
             </Col>
-            <Col md="6">
-              <Input
-                id={`${section}-${row.id}-timeout`}
-                helpKey="config.hooks.timeout"
-                type="timeout"
-                label={$_('config.hooks.timeout.label')}
-                bind:value={hook.timeout}
-                original={prev?.timeout}
-                disabled={!canWrite || row.envOnly}
-                envVar={envField(envPrefix, slug, 'TIMEOUT')}
-              />
-            </Col>
             <Col md="12">
               <Input
                 id={`${section}-${row.id}-command`}
@@ -569,7 +753,19 @@
                 {/snippet}
               </Input>
             </Col>
-            <Col md="6">
+            <Col md="4">
+              <Input
+                id={`${section}-${row.id}-timeout`}
+                helpKey="config.hooks.timeout"
+                type="timeout"
+                label={$_('config.hooks.timeout.label')}
+                bind:value={hook.timeout}
+                original={prev?.timeout}
+                disabled={!canWrite || row.envOnly}
+                envVar={envField(envPrefix, slug, 'TIMEOUT')}
+              />
+            </Col>
+            <Col md="4">
               <Input
                 id={`${section}-${row.id}-shell`}
                 helpKey="config.hooks.shell"
@@ -581,7 +777,7 @@
                 envVar={envField(envPrefix, slug, 'SHELL')}
               />
             </Col>
-            <Col md="6">
+            <Col md="4">
               <Input
                 id={`${section}-${row.id}-silent`}
                 helpKey="config.hooks.silent"
@@ -605,12 +801,12 @@
                 envVar={envField(envPrefix, slug, 'NAME')}
               />
             </Col>
-            <Col md="12">
+            <Col md="8">
               <Input
                 id={`${section}-${row.id}-url`}
                 helpKey="config.hooks.url"
                 label={$_('config.hooks.url.label')}
-                bind:value={hook.url}
+                bind:value={() => hook.url, (v) => setUrl(row, String(v ?? ''))}
                 original={prev?.url}
                 disabled={!canWrite || row.envOnly}
                 envVar={envField(envPrefix, slug, 'URL')}
@@ -633,18 +829,7 @@
                 {/snippet}
               </Input>
             </Col>
-            <Col md="6">
-              <Input
-                id={`${section}-${row.id}-ctype`}
-                helpKey="config.hooks.contentType"
-                label={$_('config.hooks.contentType.label')}
-                bind:value={hook.contentType}
-                original={prev?.contentType}
-                disabled={!canWrite || row.envOnly}
-                envVar={envField(envPrefix, slug, 'CONTENT_TYPE')}
-              />
-            </Col>
-            <Col md="6">
+            <Col md="4">
               <Input
                 id={`${section}-${row.id}-timeout`}
                 helpKey="config.hooks.timeout"
@@ -655,6 +840,41 @@
                 disabled={!canWrite || row.envOnly}
                 envVar={envField(envPrefix, slug, 'TIMEOUT')}
               />
+            </Col>
+            {#if hookShowsApiKey(hook.url)}
+              <Col md="6">
+                <Input
+                  id={`${section}-${row.id}-apikey`}
+                  type="password"
+                  label={hookFieldText('notifiarr', 'apiKey', 'label')}
+                  description={hookFieldText(
+                    'notifiarr',
+                    'apiKey',
+                    'description',
+                  )}
+                  tooltip={hookFieldText('notifiarr', 'apiKey', 'tooltip')}
+                  bind:value={
+                    () => apiKeyOf(hook),
+                    (v) => setApiKey(hook, String(v ?? ''))
+                  }
+                  original={apiKeyOf(prev ?? blank())}
+                  disabled={!canWrite || row.envOnly}
+                  envVar={envField(envPrefix, slug, 'HEADERS_X-Api-Key')}
+                />
+              </Col>
+            {/if}
+            <Col md="12">
+              <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+                <Badge color="info">{profileChip(profile)}</Badge>
+                <Button
+                  type="button"
+                  size="sm"
+                  color="primary"
+                  outline
+                  on:click={() => openGuide(row)}
+                  >{$_('config.hooks.guide.button')}</Button
+                >
+              </div>
             </Col>
             <Col md="6">
               <Input
@@ -680,6 +900,91 @@
                 envVar={envField(envPrefix, slug, 'SILENT')}
               />
             </Col>
+            {#if hookShowsField(profile, 'update')}
+              <Col md="6">
+                <Input
+                  id={`${section}-${row.id}-update`}
+                  helpKey="config.hooks.update"
+                  type="select"
+                  label={$_('config.hooks.update.label')}
+                  bind:value={hook.update}
+                  original={prev?.update}
+                  disabled={!canWrite || row.envOnly}
+                  envVar={envField(envPrefix, slug, 'UPDATE')}
+                />
+              </Col>
+            {/if}
+            {#if hookShowsField(profile, 'nickname')}
+              <Col md="6">
+                <Input
+                  id={`${section}-${row.id}-nick`}
+                  helpKey="config.hooks.nickname"
+                  label={hookFieldText(profile.template, 'nickname', 'label')}
+                  description={hookFieldText(
+                    profile.template,
+                    'nickname',
+                    'description',
+                  )}
+                  tooltip={hookFieldText(profile.template, 'nickname', 'tooltip')}
+                  bind:value={hook.nickname}
+                  original={prev?.nickname}
+                  disabled={!canWrite || row.envOnly}
+                  envVar={envField(envPrefix, slug, 'NICKNAME')}
+                />
+              </Col>
+            {/if}
+            {#if hookShowsField(profile, 'channel')}
+              <Col md="6">
+                <Input
+                  id={`${section}-${row.id}-channel`}
+                  helpKey="config.hooks.channel"
+                  label={hookFieldText(profile.template, 'channel', 'label')}
+                  description={hookFieldText(
+                    profile.template,
+                    'channel',
+                    'description',
+                  )}
+                  tooltip={hookFieldText(profile.template, 'channel', 'tooltip')}
+                  bind:value={hook.channel}
+                  original={prev?.channel}
+                  disabled={!canWrite || row.envOnly}
+                  envVar={envField(envPrefix, slug, 'CHANNEL')}
+                />
+              </Col>
+            {/if}
+            {#if hookShowsField(profile, 'token')}
+              <Col md="6">
+                <Input
+                  id={`${section}-${row.id}-token`}
+                  helpKey="config.hooks.token"
+                  type="password"
+                  label={hookFieldText(profile.template, 'token', 'label')}
+                  description={hookFieldText(
+                    profile.template,
+                    'token',
+                    'description',
+                  )}
+                  tooltip={hookFieldText(profile.template, 'token', 'tooltip')}
+                  bind:value={hook.token}
+                  original={prev?.token}
+                  disabled={!canWrite || row.envOnly}
+                  envVar={envField(envPrefix, slug, 'TOKEN')}
+                />
+              </Col>
+            {/if}
+            {#if hookShowsField(profile, 'contentType')}
+              <Col md="6">
+                <Input
+                  id={`${section}-${row.id}-ctype`}
+                  helpKey="config.hooks.contentType"
+                  label={$_('config.hooks.contentType.label')}
+                  bind:value={hook.contentType}
+                  original={prev?.contentType}
+                  disabled={!canWrite || row.envOnly}
+                  envVar={envField(envPrefix, slug, 'CONTENT_TYPE')}
+                />
+              </Col>
+            {/if}
           {/if}
           <Col md="12">
             <FormGroup>
@@ -706,68 +1011,6 @@
               {/each}
             </FormGroup>
           </Col>
-          {#if !isCmd}
-            <Col md="6">
-              <Input
-                id={`${section}-${row.id}-template`}
-                helpKey="config.hooks.template"
-                type="select"
-                label={$_('config.hooks.template.label')}
-                bind:value={hook.template}
-                original={prev?.template}
-                disabled={!canWrite || row.envOnly}
-                envVar={envField(envPrefix, slug, 'TEMPLATE')}
-                options={templateChoices}
-              />
-            </Col>
-            <Col md="6">
-              <Input
-                id={`${section}-${row.id}-tmplpath`}
-                helpKey="config.hooks.templatePath"
-                label={$_('config.hooks.templatePath.label')}
-                bind:value={hook.templatePath}
-                original={prev?.templatePath}
-                disabled={!canWrite || row.envOnly}
-                envVar={envField(envPrefix, slug, 'TEMPLATE_PATH')}
-                browse="file"
-                disableMkdir
-              />
-            </Col>
-            <Col md="6">
-              <Input
-                id={`${section}-${row.id}-nick`}
-                helpKey="config.hooks.nickname"
-                label={$_('config.hooks.nickname.label')}
-                bind:value={hook.nickname}
-                original={prev?.nickname}
-                disabled={!canWrite || row.envOnly}
-                envVar={envField(envPrefix, slug, 'NICKNAME')}
-              />
-            </Col>
-            <Col md="6">
-              <Input
-                id={`${section}-${row.id}-channel`}
-                helpKey="config.hooks.channel"
-                label={$_('config.hooks.channel.label')}
-                bind:value={hook.channel}
-                original={prev?.channel}
-                disabled={!canWrite || row.envOnly}
-                envVar={envField(envPrefix, slug, 'CHANNEL')}
-              />
-            </Col>
-            <Col md="12">
-              <Input
-                id={`${section}-${row.id}-token`}
-                helpKey="config.hooks.token"
-                type="password"
-                label={$_('config.hooks.token.label')}
-                bind:value={hook.token}
-                original={prev?.token}
-                disabled={!canWrite || row.envOnly}
-                envVar={envField(envPrefix, slug, 'TOKEN')}
-              />
-            </Col>
-          {/if}
           <Col md="12">
             <FormGroup>
               <Label>{$_('config.hooks.exclude.label')}</Label>
@@ -814,6 +1057,78 @@
               {/each}
             </FormGroup>
           </Col>
+          {#if !isCmd}
+            <Col md="12">
+              <Button
+                type="button"
+                size="sm"
+                color="link"
+                class="px-0"
+                aria-expanded={isAdvancedOpen(row)}
+                on:click={() => toggleAdvanced(row)}
+                >{$_('config.hooks.advanced')}</Button
+              >
+              <Collapse isOpen={isAdvancedOpen(row)}>
+                <Row class="g-2 mt-1">
+                  <Col md="6">
+                    <Input
+                      id={`${section}-${row.id}-template`}
+                      helpKey="config.hooks.template"
+                      type="select"
+                      label={$_('config.hooks.template.label')}
+                      bind:value={hook.template}
+                      original={prev?.template}
+                      disabled={!canWrite || row.envOnly}
+                      envVar={envField(envPrefix, slug, 'TEMPLATE')}
+                      options={templateChoices}
+                    />
+                  </Col>
+                  <Col md="6">
+                    <Input
+                      id={`${section}-${row.id}-tmplpath`}
+                      helpKey="config.hooks.templatePath"
+                      label={$_('config.hooks.templatePath.label')}
+                      bind:value={hook.templatePath}
+                      original={prev?.templatePath}
+                      disabled={!canWrite || row.envOnly}
+                      envVar={envField(envPrefix, slug, 'TEMPLATE_PATH')}
+                      browse="file"
+                      disableMkdir
+                    >
+                      {#snippet post()}
+                        {#if canCreateTemplate && !row.envOnly && !envHas(envField(envPrefix, slug, 'TEMPLATE_PATH'))}
+                          <Button
+                            type="button"
+                            color="primary"
+                            outline
+                            on:click={() => (createRow = row)}
+                          >
+                            {$_('buttons.Create')}
+                          </Button>
+                        {/if}
+                      {/snippet}
+                    </Input>
+                  </Col>
+                </Row>
+                {#if hookShowsHeaders(profile, hook.headers, hook.url)}
+                  <MapPairs
+                    bind:values={
+                      () => extraHeaders(hook),
+                      (v) => {
+                        setExtraHeaders(hook, v)
+                      }
+                    }
+                    disabled={!canWrite || row.envOnly}
+                    idPrefix={`${section}-${row.id}-headers`}
+                    helpKey="config.hooks.headers"
+                    envVar={envField(envPrefix, slug, 'HEADERS_*')}
+                    label={$_('config.hooks.headers.label')}
+                    description={$_('config.hooks.headers.description')}
+                  />
+                {/if}
+              </Collapse>
+            </Col>
+          {/if}
         </Row>
       </CardBody>
     </Card>
@@ -862,9 +1177,9 @@
     {:else if testError}
       <p class="text-danger mb-0">{testError}</p>
       {#if testElapsed}
-        <p class="text-muted mb-0 mt-2"
-          >{$_('phrases.TestDuration')}: {testElapsed}</p
-        >
+        <p class="text-muted mb-0 mt-2">
+          {$_('phrases.TestDuration')}: {testElapsed}
+        </p>
       {/if}
     {:else if testResult}
       {#if testElapsed}
@@ -887,3 +1202,39 @@
     >
   </ModalFooter>
 </Modal>
+
+<Modal isOpen={guideOpen} toggle={closeGuide}>
+  <ModalHeader toggle={closeGuide}>{guideTitle(guidePick)}</ModalHeader>
+  <ModalBody>
+    <FormGroup>
+      <Label for="hook-guide-pick">{$_('config.hooks.guide.pick')}</Label>
+      <select id="hook-guide-pick" class="form-select" bind:value={guidePick}>
+        {#each guideChoices as choice (choice.value)}
+          <option value={choice.value}>{choice.name}</option>
+        {/each}
+      </select>
+    </FormGroup>
+    {#each guideParagraphs(guidePick) as para, i (i)}
+      <p class="mt-2 mb-0">
+        {#each inlineParts(para) as part, j (`${i}-${j}`)}
+          {#if part.code}<code>{part.text}</code>{:else}{part.text}{/if}
+        {/each}
+      </p>
+    {/each}
+    <p class="mt-3 mb-0">{$_('config.hooks.guide.test')}</p>
+  </ModalBody>
+  <ModalFooter>
+    <Button color="warning" on:click={closeGuide}
+      >{$_('buttons.Close')}</Button
+    >
+  </ModalFooter>
+</Modal>
+
+{#if createRow}
+  <CreateTemplate
+    startPath={createRow.value.templatePath}
+    startTemplate={createRow.value.template}
+    oncreated={createdTemplate}
+    onclose={closeCreate}
+  />
+{/if}

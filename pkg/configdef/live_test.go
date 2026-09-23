@@ -18,6 +18,7 @@ type liveRoot struct {
 	Sonarr    map[string]liveStarr  `toml:"sonarr"`
 	Folder    map[string]liveFolder `toml:"folder"`
 	Webhook   map[string]liveHook   `toml:"webhook"`
+	Hooks     *liveHooks            `toml:"hooks"`
 }
 
 type liveWeb struct {
@@ -48,9 +49,19 @@ type liveFolder struct {
 }
 
 type liveHook struct {
-	URL    string       `toml:"url"`
-	Token  string       `toml:"token"`
-	Events []liveStatus `toml:"events"`
+	URL     string            `toml:"url"`
+	Token   string            `toml:"token"`
+	Events  []liveStatus      `toml:"events"`
+	Headers map[string]string `toml:"headers"`
+}
+
+type liveHookTitles struct {
+	Extracting string `toml:"extracting"`
+}
+
+type liveHooks struct {
+	CustomIDs map[string]string `toml:"custom_ids"`
+	Titles    liveHookTitles    `toml:"titles"`
 }
 
 type liveStatus uint8
@@ -69,13 +80,13 @@ func TestExampleTOMLContainsWebserver(t *testing.T) {
 	t.Parallel()
 
 	body := MustLoad(t).ExampleTOML()
-	for _, want := range []string{"[webserver]", "[folders]", "listen_addr", "metrics"} {
+	for _, want := range []string{"[webserver]", "[folders]", "[hooks]", "listen_addr", "metrics"} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("example TOML missing %q", want)
 		}
 	}
 
-	for _, bad := range []string{"#[webserver]", "#[folders]"} {
+	for _, bad := range []string{"#[webserver]", "#[folders]", "#[hooks]"} {
 		if strings.Contains(body, bad) {
 			t.Fatalf("singleton header must stay live, found %q", bad)
 		}
@@ -271,6 +282,102 @@ func TestFormatTOMLNilCollections(t *testing.T) {
 
 	if got := formatTOML("roles", map[string]string(nil)); got != "{}" {
 		t.Fatalf("nil map: %s", got)
+	}
+}
+
+func TestFormatTOMLStringMapIsInlineTable(t *testing.T) {
+	t.Parallel()
+
+	got := formatTOML("custom_ids", map[string]string{
+		"url":   "https://unpackerr.example",
+		"host":  "unpackerr",
+		"title": "ignored",
+	})
+	if strings.Contains(got, "custom_ids =") || strings.Count(got, "=") != 3 {
+		t.Fatalf("must be an inline table, got %q", got)
+	}
+
+	if !strings.HasPrefix(got, "{ ") || !strings.HasSuffix(got, " }") {
+		t.Fatalf("inline braces: %q", got)
+	}
+
+	decoded := struct {
+		IDs map[string]string `toml:"custom_ids"`
+	}{}
+	if err := toml.Unmarshal([]byte("custom_ids = "+got+"\n"), &decoded); err != nil {
+		t.Fatalf("inline table must parse: %v (%s)", err, got)
+	}
+
+	if decoded.IDs["url"] != "https://unpackerr.example" || decoded.IDs["host"] != "unpackerr" {
+		t.Fatalf("decoded %+v", decoded.IDs)
+	}
+}
+
+func TestRenderLiveHookStringMaps(t *testing.T) {
+	t.Parallel()
+
+	body := MustLoad(t).RenderTOML(&liveRoot{
+		Hooks: &liveHooks{
+			CustomIDs: map[string]string{"asdasdas": "asdasd"},
+			Titles:    liveHookTitles{Extracting: "Archive Found"},
+		},
+	}, RenderOpts{Mode: RenderLive})
+
+	if strings.Contains(body, "custom_ids =") || strings.Contains(body, "titles = {") ||
+		strings.Contains(body, "custom_ids = asdasdas") || strings.Contains(body, "titles = extracting") {
+		t.Fatalf("string maps must be nested tables, not assignments:\n%s", snippet(body, "[hooks]"))
+	}
+
+	if !strings.Contains(body, "[hooks.custom_ids]") || !strings.Contains(body, "[hooks.titles]") {
+		t.Fatalf("missing nested hook tables:\n%s", snippet(body, "[hooks]"))
+	}
+
+	if !strings.Contains(body, `asdasdas = "asdasd"`) || !strings.Contains(body, `extracting = "Archive Found"`) {
+		t.Fatalf("missing map rows:\n%s", snippet(body, "[hooks]"))
+	}
+
+	decoded := struct {
+		Hooks liveHooks `toml:"hooks"`
+	}{}
+	if err := toml.Unmarshal([]byte(body), &decoded); err != nil {
+		t.Fatalf("written TOML must parse: %v\n%s", err, snippet(body, "[hooks]"))
+	}
+
+	if decoded.Hooks.CustomIDs["asdasdas"] != "asdasd" || decoded.Hooks.Titles.Extracting != "Archive Found" {
+		t.Fatalf("decoded %+v", decoded.Hooks)
+	}
+}
+
+func TestRenderLiveWebhookHeaders(t *testing.T) {
+	t.Parallel()
+
+	body := MustLoad(t).RenderTOML(&liveRoot{
+		Webhook: map[string]liveHook{
+			"discord": {
+				URL:     "https://discord.com/api/webhooks/1/x",
+				Headers: map[string]string{"X-Api-Key": "secret", "Authorization": "Bearer tok"},
+			},
+		},
+	}, RenderOpts{Mode: RenderLive})
+
+	if strings.Contains(body, "[webhook.headers]") || strings.Contains(body, "headers =") {
+		t.Fatalf("headers must nest under the instance:\n%s", snippet(body, "[webhook"))
+	}
+
+	if !strings.Contains(body, "[webhook.discord.headers]") {
+		t.Fatalf("missing [webhook.discord.headers]:\n%s", snippet(body, "[webhook"))
+	}
+
+	decoded := struct {
+		Webhook map[string]liveHook `toml:"webhook"`
+	}{}
+	if err := toml.Unmarshal([]byte(body), &decoded); err != nil {
+		t.Fatalf("written TOML must parse: %v\n%s", err, snippet(body, "[webhook"))
+	}
+
+	got := decoded.Webhook["discord"].Headers
+	if got["X-Api-Key"] != "secret" || got["Authorization"] != "Bearer tok" {
+		t.Fatalf("decoded %+v", got)
 	}
 }
 

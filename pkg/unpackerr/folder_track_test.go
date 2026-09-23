@@ -21,15 +21,7 @@ func TestFolderWaitingShowsInQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() {
-		if tracker.Watcher != nil {
-			tracker.Watcher.Close()
-		}
-
-		if tracker.FSNotify != nil {
-			_ = tracker.FSNotify.Close()
-		}
-	})
+	t.Cleanup(tracker.Close)
 
 	unpack.folders = tracker
 
@@ -46,7 +38,7 @@ func TestFolderWaitingShowsInQueue(t *testing.T) {
 		t.Fatalf("queue item %+v", item)
 	}
 
-	if got := queueFromExtract(archive, item); got.Progress != "last write" {
+	if got := unpack.queueFromExtract(archive, item); got.Progress != "last write" {
 		t.Fatalf("progress %q", got.Progress)
 	}
 
@@ -81,15 +73,7 @@ func TestCheckFolderStatsDropsMissingWaiting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(func() {
-		if tracker.Watcher != nil {
-			tracker.Watcher.Close()
-		}
-
-		if tracker.FSNotify != nil {
-			_ = tracker.FSNotify.Close()
-		}
-	})
+	t.Cleanup(tracker.Close)
 
 	unpack.folders = tracker
 
@@ -175,5 +159,48 @@ func TestCheckFolderStatsCopiesRetriesToHistory(t *testing.T) {
 	got := unpack.historySnapshot()
 	if len(got) != 1 || got[0].Retries != 1 || got[0].Status != DELETED {
 		t.Fatalf("history %+v", got)
+	}
+}
+
+func TestCheckFolderStatsCheckpointsWaitingHistory(t *testing.T) {
+	t.Parallel()
+
+	const name = "/watch/corrupt"
+
+	unpack := New()
+	unpack.MaxRetries = 2
+	unpack.RetryDelay.Duration = time.Second
+	unpack.KeepHistory = 10
+	unpack.histPath = filepath.Join(t.TempDir(), historyFileName)
+	unpack.folders.Config = []*FolderConfig{{Path: "/watch"}}
+
+	now := time.Now()
+	failedAt := now.Add(-time.Minute)
+	unpack.folders.Folders[name] = &Folder{
+		Status: EXTRACTFAILED, Updated: failedAt, Config: &FolderConfig{Path: name},
+	}
+	unpack.Map[name] = &Extract{
+		App: FolderString, Path: name, Status: EXTRACTFAILED, Updated: failedAt,
+	}
+
+	unpack.checkFolderStats(now)
+
+	if len(unpack.records) != 1 || unpack.records[0].Status != WAITING || unpack.records[0].Retries != 1 {
+		t.Fatalf("auto re-wait history %+v", unpack.records)
+	}
+
+	unpack.Map = map[string]*Extract{}
+	unpack.folders.Folders = map[string]*Folder{}
+	unpack.restoreQueueFromHistory()
+
+	item := unpack.Map[name]
+	folder := unpack.folders.Folders[name]
+
+	if item == nil || item.Status != WAITING || item.Retries != 1 {
+		t.Fatalf("restore after auto re-wait %+v", item)
+	}
+
+	if folder == nil || folder.Status != WAITING || folder.Retries != 1 {
+		t.Fatalf("tracker after auto re-wait %+v", folder)
 	}
 }

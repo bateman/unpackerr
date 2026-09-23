@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -33,57 +34,83 @@ var (
 
 // HistoryRecord is one JSONL row (history API + restart resume).
 type HistoryRecord struct {
-	ID          string        `json:"id"`
-	App         string        `json:"app"`
-	Kind        string        `json:"kind,omitempty"` // Starr dialect or Folder; App is the instance label.
-	URL         string        `json:"url,omitempty"`
-	Path        string        `json:"path"`
-	OutputPath  string        `json:"outputPath,omitempty"`
-	Status      ExtractStatus `json:"status"`
-	Retries     uint          `json:"retries"`
-	Started     time.Time     `json:"started"`
-	Updated     time.Time     `json:"updated"`
-	Finished    time.Time     `json:"finished,omitzero"`
-	Archives    int           `json:"archives,omitempty"`
-	Files       int           `json:"files,omitempty"`
-	Bytes       uint64        `json:"bytes,omitempty"`
-	Ratio       float64       `json:"ratio,omitempty"`
-	Elapsed     string        `json:"elapsed,omitempty"`
-	Error       string        `json:"error,omitempty"`
-	Progress    string        `json:"progress,omitempty"`
-	DeleteOrig  bool          `json:"deleteOrig,omitempty"`
-	DeleteDelay string        `json:"deleteDelay,omitempty"` // Go duration, e.g. 5m0s
-	Syncthing   bool          `json:"syncthing,omitempty"`
-	SplitFlac   bool          `json:"splitFlac,omitempty"`
-	MaxBytes    uint64        `json:"maxBytes,omitempty"`
-	NoRetry     bool          `json:"noRetry,omitempty"`
-	NewFiles    []string      `json:"newFiles,omitempty"`
-	PreFiles    []string      `json:"preFiles,omitempty"`
-	Forgotten   bool          `json:"forgotten,omitempty"`
+	ID           string            `json:"id"`
+	App          string            `json:"app"`
+	Kind         string            `json:"kind,omitempty"` // Starr dialect or Folder; App is the instance label.
+	URL          string            `json:"url,omitempty"`
+	Path         string            `json:"path"`
+	OutputPath   string            `json:"outputPath,omitempty"`
+	Status       ExtractStatus     `json:"status"`
+	Retries      uint              `json:"retries"`
+	HookFail     uint              `json:"hookFail,omitempty"`
+	HookMessages map[string]string `json:"hookMessages,omitempty"`
+	Started      time.Time         `json:"started"`
+	Updated      time.Time         `json:"updated"`
+	Finished     time.Time         `json:"finished,omitzero"`
+	Archives     int               `json:"archives,omitempty"`
+	Files        int               `json:"files,omitempty"`
+	Bytes        uint64            `json:"bytes,omitempty"`
+	Ratio        float64           `json:"ratio,omitempty"`
+	Elapsed      string            `json:"elapsed,omitempty"`
+	Error        string            `json:"error,omitempty"`
+	Progress     string            `json:"progress,omitempty"`
+	DeleteOrig   bool              `json:"deleteOrig,omitempty"`
+	DeleteDelay  string            `json:"deleteDelay,omitempty"` // Go duration, e.g. 5m0s
+	Syncthing    bool              `json:"syncthing,omitempty"`
+	SplitFlac    bool              `json:"splitFlac,omitempty"`
+	MaxBytes     uint64            `json:"maxBytes,omitempty"`
+	NoRetry      bool              `json:"noRetry,omitempty"`
+	NewFiles     []string          `json:"newFiles,omitempty"`
+	OrigFiles    []string          `json:"origFiles,omitempty"`  // Archive paths; folder delete_orig after a restart.
+	ExtraFiles   []string          `json:"extraFiles,omitempty"` // Nested extras; display + restore Resp.Extras.
+	PreFiles     []string          `json:"preFiles,omitempty"`
+	Forgotten    bool              `json:"forgotten,omitempty"`
+	IDs          map[string]any    `json:"ids,omitempty"` // Starr hook metadata (title, downloadId, …).
+	Event        string            `json:"event,omitempty"`
+	Queue        int               `json:"queue,omitempty"`  // xtractr waiting count when this extract started.
+	Output       string            `json:"output,omitempty"` // xtractr dest folder.
 }
 
 // QueueItem is a live in-flight extract for GET /api/queue.
 type QueueItem struct {
-	ID         string        `json:"id"`
-	App        string        `json:"app"`
-	URL        string        `json:"url,omitempty"`
-	Path       string        `json:"path"`
-	OutputPath string        `json:"outputPath,omitempty"`
-	Status     ExtractStatus `json:"status"`
-	Retries    uint          `json:"retries"`
-	Updated    time.Time     `json:"updated"`
-	Progress   string        `json:"progress,omitempty"`
-	Error      string        `json:"error,omitempty"`
-	Percent    float64       `json:"percent,omitempty"`
-	Wrote      uint64        `json:"wrote,omitempty"`
-	Total      uint64        `json:"total,omitempty"`
-	Read       uint64        `json:"read,omitempty"`
-	Compressed uint64        `json:"compressed,omitempty"`
-	Files      int           `json:"files,omitempty"`
-	Count      int           `json:"count,omitempty"`
-	Archives   int           `json:"archives,omitempty"`
-	Extracted  int           `json:"extracted,omitempty"`
-	Archive    string        `json:"archive,omitempty"`
+	ID          string         `json:"id"`
+	App         string         `json:"app"`
+	URL         string         `json:"url,omitempty"`
+	Path        string         `json:"path"`
+	OutputPath  string         `json:"outputPath,omitempty"`
+	Status      ExtractStatus  `json:"status"`
+	Retries     uint           `json:"retries"`
+	HookFail    uint           `json:"hookFail,omitempty"`
+	Updated     time.Time      `json:"updated"`
+	Progress    string         `json:"progress,omitempty"`
+	Error       string         `json:"error,omitempty"`
+	Percent     float64        `json:"percent,omitempty"`
+	Wrote       uint64         `json:"wrote,omitempty"`
+	Total       uint64         `json:"total,omitempty"`
+	Read        uint64         `json:"read,omitempty"`
+	Compressed  uint64         `json:"compressed,omitempty"`
+	Files       int            `json:"files,omitempty"`
+	Count       int            `json:"count,omitempty"`
+	Archives    int            `json:"archives,omitempty"`
+	Extracted   int            `json:"extracted,omitempty"`
+	Archive     string         `json:"archive,omitempty"`
+	SpeedBps    uint64         `json:"speedBps,omitempty"`    // last sample interval
+	AvgSpeedBps uint64         `json:"avgSpeedBps,omitempty"` // bytes so far / extract duration
+	ETA         time.Time      `json:"eta,omitzero"`
+	Due         time.Time      `json:"due,omitzero"`
+	DueKind     string         `json:"dueKind,omitempty"` // start, retry, cleanup, history
+	Note        string         `json:"note,omitempty"`
+	Event       string         `json:"event,omitempty"` // folders: fsnotify, polling; later manual
+	Started     time.Time      `json:"started,omitzero"`
+	Elapsed     string         `json:"elapsed,omitempty"`
+	Bytes       uint64         `json:"bytes,omitempty"`
+	Ratio       float64        `json:"ratio,omitempty"`
+	Queue       int            `json:"queue,omitempty"`  // xtractr waiting count when this extract started.
+	Output      string         `json:"output,omitempty"` // xtractr dest folder.
+	Kind        string         `json:"kind,omitempty"`
+	IDs         map[string]any `json:"ids,omitempty"`
+	NewFiles    []string       `json:"newFiles,omitempty"`  // GET /api/queue/item only; omitted from progress.
+	OrigFiles   []string       `json:"origFiles,omitempty"` // GET /api/queue/item only; omitted from progress.
 }
 
 func isDurableHistory(status ExtractStatus) bool {
@@ -96,9 +123,18 @@ func isDurableHistory(status ExtractStatus) bool {
 }
 
 // isPersistedHistory is written to JSONL so a restart can rebuild the live queue.
-// WAITING is left out; the next Starr poll recreates it.
-func isPersistedHistory(status ExtractStatus) bool {
-	switch status {
+// Starr WAITING is left out; the next poll recreates it. Folder WAITING is kept so
+// a retry after EXTRACTFAILED cannot restore the old failed row.
+func isPersistedHistory(item *Extract) bool {
+	if item == nil {
+		return false
+	}
+
+	if item.Status == WAITING && item.App == FolderString {
+		return true
+	}
+
+	switch item.Status {
 	case QUEUED, EXTRACTING, EXTRACTFAILED, EXTRACTED, IMPORTED,
 		DELETING, DELETEFAILED, DELETED, EXTRACTEDNOTHING:
 		return true
@@ -116,7 +152,8 @@ func (u *Unpackerr) historyFilePath() string {
 		return filepath.Join(filepath.Dir(u.ConfigFile), historyFileName)
 	}
 
-	return expandHomedir(filepath.Join("~", ".unpackerr", historyFileName))
+	// Env-only (stdout logs, no config file): keep history in memory only.
+	return ""
 }
 
 func (u *Unpackerr) loadHistory() {
@@ -129,7 +166,7 @@ func (u *Unpackerr) loadHistory() {
 	}
 
 	if u.histPath == "" {
-		u.Printf("[Unpackerr] History file disabled; keep_history=%d but no log, config, or home path",
+		u.Printf("[Unpackerr] History file disabled; keep_history=%d but no log or config file",
 			u.KeepHistory)
 
 		return
@@ -250,7 +287,7 @@ func (u *Unpackerr) capHistoryLocked(list []HistoryRecord) []HistoryRecord {
 }
 
 func (u *Unpackerr) maybeRecordHistory(itemID string, item *Extract) {
-	if u.KeepHistory == 0 || !isPersistedHistory(item.Status) {
+	if u.KeepHistory == 0 || !isPersistedHistory(item) {
 		return
 	}
 
@@ -264,22 +301,26 @@ func historyFromExtract(itemID string, item *Extract) HistoryRecord {
 	}
 
 	rec := HistoryRecord{
-		ID:         itemID,
-		App:        item.Label(),
-		Kind:       string(item.App),
-		URL:        item.URL,
-		Path:       item.Path,
-		OutputPath: item.OutputPath,
-		Status:     item.Status,
-		Retries:    item.Retries,
-		Started:    now,
-		Updated:    now,
-		DeleteOrig: item.DeleteOrig,
-		Syncthing:  item.Syncthing,
-		SplitFlac:  item.SplitFlac,
-		MaxBytes:   item.MaxBytes,
-		NoRetry:    item.NoRetry,
-		PreFiles:   preFileKeys(item.PreFiles),
+		ID:           itemID,
+		App:          item.Label(),
+		Kind:         string(item.App),
+		URL:          item.URL,
+		Path:         item.Path,
+		OutputPath:   item.OutputPath,
+		Status:       item.Status,
+		Retries:      item.Retries,
+		HookFail:     item.HookFail,
+		HookMessages: maps.Clone(item.HookMessages),
+		Started:      now,
+		Updated:      now,
+		DeleteOrig:   item.DeleteOrig,
+		Syncthing:    item.Syncthing,
+		SplitFlac:    item.SplitFlac,
+		MaxBytes:     item.MaxBytes,
+		NoRetry:      item.NoRetry,
+		PreFiles:     preFileKeys(item.PreFiles),
+		IDs:          cloneIDs(item.IDs),
+		Event:        item.Event,
 	}
 
 	if item.DeleteDelay != 0 {
@@ -317,7 +358,11 @@ func fillHistoryStats(rec *HistoryRecord, item *Extract) {
 	rec.Archives = item.Resp.Archives.Count() + item.Resp.Extras.Count()
 	rec.Files = len(item.Resp.NewFiles)
 	rec.Bytes = item.Resp.Size
-	rec.NewFiles = append([]string(nil), item.Resp.NewFiles...)
+	rec.Queue = item.Resp.Queued
+	rec.Output = item.Resp.Output
+	rec.NewFiles = slices.Clone(item.Resp.NewFiles)
+	rec.OrigFiles = slices.Clone(item.Resp.Archives.List())
+	rec.ExtraFiles = slices.Clone(item.Resp.Extras.List())
 
 	if item.Resp.Elapsed > 0 {
 		rec.Elapsed = item.Resp.Elapsed.Round(time.Second).String()
@@ -334,6 +379,10 @@ func (u *Unpackerr) upsertHistory(rec HistoryRecord) {
 	u.histMu.Lock()
 	defer u.histMu.Unlock()
 
+	u.upsertHistoryLocked(rec)
+}
+
+func (u *Unpackerr) upsertHistoryLocked(rec HistoryRecord) {
 	u.records = u.capHistoryLocked(mergeHistory(u.records, rec))
 	if len(u.records) == 0 {
 		return
@@ -442,16 +491,23 @@ func (u *Unpackerr) queueSnapshot() []QueueItem {
 	return u.queueSnapshotLocked()
 }
 
-func queueFromExtract(id string, item *Extract) QueueItem {
+func (u *Unpackerr) queueFromExtract(itemID string, item *Extract) QueueItem {
 	queue := QueueItem{
-		ID:         id,
+		ID:         itemID,
 		App:        item.Label(),
 		URL:        item.URL,
 		Path:       item.Path,
 		OutputPath: item.OutputPath,
 		Status:     item.Status,
 		Retries:    item.Retries,
+		HookFail:   item.HookFail,
 		Updated:    item.Updated,
+		Due:        item.Due,
+		DueKind:    item.DueKind,
+		Note:       item.Note,
+		Event:      item.Event,
+		Kind:       string(item.App),
+		IDs:        cloneIDs(item.IDs),
 	}
 
 	if item.Status == WAITING && item.App == FolderString {
@@ -462,34 +518,182 @@ func queueFromExtract(id string, item *Extract) QueueItem {
 		queue.Progress = item.Note
 	}
 
-	if item.XProg != nil {
-		if prog := item.XProg.String(); prog != "no progress yet" {
-			queue.Progress = prog
-		}
-
-		if prog := item.XProg.Progress; prog != nil {
-			queue.Percent = prog.Percent()
-			queue.Wrote = prog.Wrote
-			queue.Total = prog.Total
-			queue.Read = prog.Read
-			queue.Compressed = prog.Compressed
-			queue.Files = prog.Files
-			queue.Count = prog.Count
-			queue.Archives = item.XProg.Archives
-			queue.Extracted = item.XProg.Extracted
-
-			if prog.XFile != nil {
-				rel := strings.TrimPrefix(prog.XFile.FilePath, item.Path)
-				queue.Archive = strings.TrimLeft(filepath.ToSlash(rel), `/\`)
-			}
-		}
-	}
+	fillQueueProgress(&queue, item)
+	fillQueueMeta(&queue, item)
 
 	if item.Resp != nil && item.Resp.Error != nil {
 		queue.Error = item.Resp.Error.Error()
 	}
 
 	return queue
+}
+
+func fillQueueMeta(queue *QueueItem, item *Extract) {
+	if item.XProg != nil && item.XProg.Progress != nil && item.XProg.Compressed > 0 &&
+		item.Resp != nil && item.Resp.Size > 0 {
+		queue.Ratio = float64(item.Resp.Size) / float64(item.XProg.Compressed)
+	}
+
+	if item.Resp == nil {
+		return
+	}
+
+	if !item.Resp.Started.IsZero() {
+		queue.Started = item.Resp.Started
+		switch {
+		case item.Resp.Elapsed > 0:
+			queue.Elapsed = item.Resp.Elapsed.Round(time.Second).String()
+		case item.Status == EXTRACTING:
+			queue.Elapsed = time.Since(item.Resp.Started).Round(time.Second).String()
+		}
+	}
+
+	queue.Bytes = item.Resp.Size
+	queue.Queue = item.Resp.Queued
+	queue.Output = item.Resp.Output
+}
+
+// fillQueueFiles copies archive and extracted paths. Progress websocket frames
+// omit them so an ISO extract does not push thousands of paths every tick.
+func fillQueueFiles(queue *QueueItem, item *Extract) {
+	if item.Resp == nil {
+		return
+	}
+
+	if n := len(item.Resp.NewFiles); n > 0 {
+		queue.NewFiles = slices.Clone(item.Resp.NewFiles)
+	}
+
+	if archives := respArchivePaths(item); len(archives) > 0 {
+		queue.OrigFiles = archives
+	}
+}
+
+func respArchivePaths(item *Extract) []string {
+	if item == nil || item.Resp == nil {
+		return nil
+	}
+
+	return append(slices.Clone(item.Resp.Archives.List()), item.Resp.Extras.List()...)
+}
+
+func cloneIDs(ids map[string]any) map[string]any {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	out := make(map[string]any, len(ids))
+	maps.Copy(out, ids)
+
+	return out
+}
+
+func fillQueueProgress(queue *QueueItem, item *Extract) {
+	if item.XProg == nil {
+		return
+	}
+
+	if prog := item.XProg.String(); prog != "no progress yet" {
+		queue.Progress = prog
+	}
+
+	prog := item.XProg.Progress
+	if prog == nil {
+		return
+	}
+
+	queue.Percent = prog.Percent()
+	queue.Wrote = prog.Wrote
+	queue.Total = prog.Total
+	queue.Read = prog.Read
+	queue.Compressed = prog.Compressed
+	queue.Files = prog.Files
+	queue.Count = prog.Count
+	queue.Archives = item.XProg.Archives
+	queue.Extracted = item.XProg.Extracted
+	queue.SpeedBps = item.XProg.SpeedBps
+	queue.AvgSpeedBps = item.XProg.AvgSpeedBps
+	queue.ETA = item.XProg.ETA
+
+	if prog.XFile != nil {
+		rel := strings.TrimPrefix(prog.XFile.FilePath, item.Path)
+		queue.Archive = strings.TrimLeft(filepath.ToSlash(rel), `/\`)
+	}
+}
+
+const (
+	dueStart   = "start"
+	dueRetry   = "retry"
+	dueCleanup = "cleanup"
+	dueHistory = "history"
+)
+
+// stampQueueDue writes the next timer onto the extract. Call from the main
+// loop after Status or Updated changes; HTTP readers only copy the fields.
+func (u *Unpackerr) stampQueueDue(itemID string, item *Extract) {
+	if item == nil {
+		return
+	}
+
+	item.Due, item.DueKind = u.queueDue(itemID, item)
+}
+
+func (u *Unpackerr) queueDue(itemID string, item *Extract) (time.Time, string) {
+	switch item.Status {
+	case WAITING:
+		if u.StartDelay.Duration <= 0 {
+			return time.Time{}, ""
+		}
+
+		if item.App != FolderString && item.Note != "" {
+			return time.Time{}, ""
+		}
+
+		return item.Updated.Add(u.StartDelay.Duration), dueStart
+	case EXTRACTFAILED:
+		if item.NoRetry || item.Retries >= u.maxRetries() {
+			return time.Time{}, ""
+		}
+
+		return item.Updated.Add(u.RetryDelay.Duration), dueRetry
+	case EXTRACTED:
+		delay := u.folderDeleteAfter(itemID, item)
+		if delay <= 0 {
+			return time.Time{}, ""
+		}
+
+		return item.Updated.Add(delay), dueCleanup
+	case IMPORTED:
+		if item.DeleteDelay < 0 {
+			return time.Time{}, ""
+		}
+
+		return item.Updated.Add(item.DeleteDelay), dueCleanup
+	case DELETED:
+		return item.Updated.Add(item.DeleteDelay), dueHistory
+	case EXTRACTEDNOTHING:
+		if item.App != FolderString || u.StartDelay.Duration <= 0 {
+			return time.Time{}, ""
+		}
+
+		return item.Updated.Add(u.StartDelay.Duration), dueHistory
+	default:
+		return time.Time{}, ""
+	}
+}
+
+func (u *Unpackerr) folderDeleteAfter(itemID string, item *Extract) time.Duration {
+	if item.App != FolderString {
+		return 0
+	}
+
+	if u.folders != nil {
+		if folder := u.folders.Folders[itemID]; folder != nil && folder.Config != nil && folder.Config.DeleteAfter != nil {
+			return folder.Config.DeleteAfter.Duration
+		}
+	}
+
+	return item.DeleteDelay
 }
 
 func (u *Unpackerr) deleteHistoryID(itemID string) error {

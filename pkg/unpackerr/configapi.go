@@ -3,6 +3,7 @@ package unpackerr
 import (
 	"net/http"
 
+	"github.com/Unpackerr/unpackerr/pkg/hooks"
 	"golift.io/cnfg"
 )
 
@@ -32,11 +33,10 @@ type generalConfig struct {
 	Passwords     StringSlice   `json:"passwords"`
 }
 
-// foldersConfigAPI is global folder poller settings plus the watch list.
+// foldersConfigAPI is the event buffer plus the watch list.
 type foldersConfigAPI struct {
-	Interval cnfg.Duration             `json:"interval"`
-	Buffer   uint                      `json:"buffer"`
-	Folder   InstanceMap[FolderConfig] `json:"folder"`
+	Buffer uint                      `json:"buffer"`
+	Folder InstanceMap[FolderConfig] `json:"folder"`
 }
 
 func (u *Unpackerr) requireConfigPerm(write bool, next http.HandlerFunc) http.HandlerFunc {
@@ -131,6 +131,8 @@ func configSectionFrom(cfg *Config, section ConfigSection) any {
 		return emptyIfNilMap(cfg.Readarr)
 	case SectionFolders:
 		return foldersConfigFrom(cfg)
+	case SectionHooks:
+		return hooksConfigFrom(cfg)
 	case SectionWebhooks:
 		return emptyIfNilMap(cfg.Webhook)
 	case SectionCmdhooks:
@@ -203,9 +205,15 @@ func publicWebserver(web *WebServer) *WebServer {
 
 func foldersConfigFrom(cfg *Config) foldersConfigAPI {
 	return foldersConfigAPI{
-		Interval: cfg.Folder.Interval,
-		Buffer:   cfg.Folder.Buffer,
-		Folder:   emptyIfNilMap(cfg.Folders),
+		Buffer: cfg.Folder.Buffer,
+		Folder: emptyIfNilMap(cfg.Folders),
+	}
+}
+
+func hooksConfigFrom(cfg *Config) HooksConfig {
+	return HooksConfig{
+		CustomIDs: emptyIfNilMap(cfg.Hooks.CustomIDs),
+		Titles:    cfg.Hooks.Titles,
 	}
 }
 
@@ -249,6 +257,7 @@ func redactHookSecrets(items InstanceMap[WebhookConfig]) {
 	for _, hook := range items {
 		if hook != nil {
 			hook.Token = ""
+			hooks.RedactHeaderSecrets(hook.Headers)
 		}
 	}
 }

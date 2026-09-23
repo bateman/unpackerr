@@ -45,22 +45,14 @@ func validateFolderList(list InstanceMap[FolderConfig]) error {
 // if those changes include the addition of compressed files, they
 // are processed for exctraction.
 func (u *Unpackerr) PollFolders() {
-	var (
-		flist []string
-		err   error
-	)
-
-	if isRunningInDocker() && u.Folder.Interval.Duration == 0 {
-		u.Folder.Interval.Duration = folders.DefaultPollInterval
-	}
-
 	// Abs-expand a clone so GET /api/config/folders/live keeps the configured
 	// path (file vs env), not the runtime filepath.Abs rewrite.
-	watched, flist := folders.Check(folders.CloneList(instanceValues(u.Folders)), u.Logger)
+	watched, _ := folders.Check(folders.CloneList(instanceValues(u.Folders)), u.Logger)
 
 	tracker, err := u.Folder.NewWatcher(watched, u.Logger, updateChanBuf, suffix)
 	if err != nil {
 		u.Errorf("Watching Folders: %s", err)
+
 		return
 	}
 
@@ -73,21 +65,14 @@ func (u *Unpackerr) PollFolders() {
 
 	go u.folders.WatchFSNotify()
 
-	u.Printf("[Folder] Watching (fsnotify): %s", strings.Join(flist, ", "))
-
-	// Setting an interval of any value less than 5 milliseconds
-	// (except zero in docker) allows disabling the poller.
-	if u.Folder.Interval.Duration < folders.MinimumPollInterval {
-		return
+	if watching := u.folders.FSNotifyPaths(); len(watching) > 0 {
+		u.Printf("[Folder] Watching (fsnotify): %s", strings.Join(watching, ", "))
 	}
 
-	go func() {
-		if err := u.folders.StartPoller(u.Folder.Interval.Duration); err != nil {
-			u.Errorf("%s", err)
-		}
-	}()
-
-	u.Printf("[Folder] Polling @ %s: %s", u.Folder.Interval.String(), strings.Join(flist, ", "))
+	if summaries := u.folders.PollerSummaries(); len(summaries) > 0 {
+		u.folders.StartPollers()
+		u.Printf("[Folder] Polling: %s", strings.Join(summaries, ", "))
+	}
 }
 
 // extractTrackedItem starts an archive or folder's extraction after it hasn't been written to in a while.
@@ -101,12 +86,7 @@ func (u *Unpackerr) extractTrackedItem(name string, folder *Folder, now time.Tim
 		return
 	}
 
-	// create a queue counter in the main history; add to u.Map and send webhook for a new folder.
-	u.lockHistory()
-	item := u.updateQueueStatus(&newStatus{Name: name, Status: QUEUED}, u.folders.Folders[name].Updated, true)
-	u.unlockHistory()
-
-	exclude := folderExcludeSuffixes(name, folder.Config)
+	exclude := folderExcludeSuffixes(folder.Config)
 
 	if folder.Config.MoveBack {
 		found := xtractr.FindCompressedFiles(xtractr.Filter{
@@ -122,6 +102,11 @@ func (u *Unpackerr) extractTrackedItem(name string, folder *Folder, now time.Tim
 			folder.PreFiles = snap
 		}
 	}
+
+	// create a queue counter in the main history; add to u.Map and send webhook for a new folder.
+	u.lockHistory()
+	item := u.updateQueueStatus(&newStatus{Name: name, Status: QUEUED}, u.folders.Folders[name].Updated, true)
+	u.unlockHistory()
 
 	// extract it.
 	queueSize, err := u.Extract(&xtractr.Xtract{
@@ -170,24 +155,14 @@ func (u *Unpackerr) skipR00Extraction(name string, now time.Time) bool {
 }
 
 // folderExcludeSuffixes returns archive suffixes to ignore when scanning for items to extract.
-// For watched archive files with disable_recursion enabled, exclude all archive suffixes so
-// extracted nested archives are not picked up by follow-up scans in the extraction library.
-func folderExcludeSuffixes(path string, cfg *FolderConfig) []string {
-	exclude := []string{}
-	if !cfg.ExtractISOs {
-		exclude = append(exclude, ".iso")
+// xtractr applies this list even when the search path is the archive itself, so a watched
+// archive must stay searchable. Nested archives are skipped with DisableRecursion.
+func folderExcludeSuffixes(cfg *FolderConfig) []string {
+	if cfg.ExtractISOs {
+		return nil
 	}
 
-	if !cfg.DisableRecursion {
-		return exclude
-	}
-
-	stat, err := os.Stat(path)
-	if err != nil || stat.IsDir() || !xtractr.IsArchiveFile(path) {
-		return exclude
-	}
-
-	return append(exclude, xtractr.SupportedExtensions()...)
+	return []string{".iso"}
 }
 
 func getFileList(path string) []os.FileInfo {
@@ -220,7 +195,7 @@ func (u *Unpackerr) folderXtractrCallback(resp *xtractr.Response) {
 
 	if !found || item == nil {
 		delete(u.folders.Folders, resp.X.Name)
-		delete(u.Map, resp.X.Name)
+		u.deleteExtract(resp.X.Name)
 		u.notifyQueueLocked()
 		u.unlockHistory()
 
@@ -228,7 +203,8 @@ func (u *Unpackerr) folderXtractrCallback(resp *xtractr.Response) {
 	}
 
 	if !resp.Done {
-		item.XProg.Archives = resp.Archives.Count() + resp.Extras.Count()
+		resetExtractProgress(item, resp.Archives.Count()+resp.Extras.Count())
+
 		folder.Status = EXTRACTING
 		u.Printf("[Folder] Extraction Started: %s, retries: %d, items in queue: %d", resp.X.Name, folder.Retries, resp.Queued)
 		folder.Updated = now
@@ -343,19 +319,23 @@ func (u *Unpackerr) processEvent(event *eventData, now time.Time) {
 	}
 
 	u.folders.ProcessEvent(event, now)
-	u.syncFolderQueue(filepath.Join(event.Config.Path, event.Name))
+
+	dirPath := filepath.Join(event.Config.Path, event.Name)
+
+	u.syncFolderQueue(dirPath, event.Kind())
+	u.refreshFolderWait(dirPath)
 }
 
 // syncFolderQueue mirrors a watched folder into the overview queue while it is
 // still tracking writes (before start_delay queues extraction).
-func (u *Unpackerr) syncFolderQueue(dirPath string) {
+func (u *Unpackerr) syncFolderQueue(dirPath, kind string) {
 	u.lockHistory()
 	defer u.unlockHistory()
 
 	folder, ok := u.folders.Folders[dirPath]
 	if !ok {
 		if item := u.Map[dirPath]; item != nil && item.App == FolderString && item.Status == WAITING {
-			delete(u.Map, dirPath)
+			u.deleteExtract(dirPath)
 			u.notifyQueueLocked()
 		}
 
@@ -367,7 +347,16 @@ func (u *Unpackerr) syncFolderQueue(dirPath string) {
 	}
 
 	if _, exists := u.Map[dirPath]; !exists {
-		u.updateQueueStatus(&newStatus{Name: dirPath, Status: WAITING}, folder.Updated, false)
+		waitFile := ""
+		if folder.Config != nil {
+			waitFile = folders.WaitFileInTop(dirPath, folder.Config.WaitExtensions)
+		}
+
+		folder.WaitFile = waitFile
+		u.updateQueueStatus(&newStatus{
+			Name: dirPath, Status: WAITING, Event: kind, Note: waitFile,
+		}, folder.Updated, false)
+
 		return
 	}
 
@@ -377,9 +366,14 @@ func (u *Unpackerr) syncFolderQueue(dirPath string) {
 	}
 
 	item.Updated = folder.Updated
+	if kind != "" {
+		item.Event = kind
+	}
+
+	u.stampQueueDue(dirPath, item)
 
 	if u.hub != nil {
-		u.hub.notifyProgress(queueFromExtract(dirPath, item))
+		u.hub.notifyProgress(u.queueFromExtract(dirPath, item))
 	}
 }
 
@@ -387,14 +381,27 @@ func (u *Unpackerr) checkWaitingFolder(name string, folder *Folder, now time.Tim
 	if _, err := os.Stat(name); err != nil {
 		delete(u.folders.Folders, name)
 		u.folders.Remove(name)
-		u.syncFolderQueue(name)
+		u.syncFolderQueue(name, "")
 
 		return
 	}
 
-	if now.Sub(folder.Updated) >= u.StartDelay.Duration {
-		u.extractTrackedItem(name, folder, now)
+	if u.folderWaitActive(folder, name, now) {
+		return
 	}
+
+	if now.Sub(folder.Updated) < u.StartDelay.Duration {
+		return
+	}
+
+	if folder.Config != nil && folder.Config.SkipEmpty && u.folderArchiveCount(name, folder) == 0 {
+		u.Printf("[Folder] Skipping empty folder: %s", name)
+		u.dropFolderUnqueued(name)
+
+		return
+	}
+
+	u.extractTrackedItem(name, folder, now)
 }
 
 // checkFolderStats runs at an interval to see if any folders need work done on them.
@@ -409,7 +416,7 @@ func (u *Unpackerr) checkFolderStats(now time.Time) {
 			if now.Sub(folder.Updated) > u.StartDelay.Duration {
 				// Ignore "no compressed files" errors for folders.
 				u.lockHistory()
-				delete(u.Map, name)
+				u.deleteExtract(name)
 				u.notifyQueueLocked()
 				u.unlockHistory()
 				delete(u.folders.Folders, name)
@@ -449,6 +456,7 @@ func (u *Unpackerr) checkFailedFolder(name string, folder *Folder, now time.Time
 		if item := u.Map[name]; item != nil {
 			item.Status = WAITING
 			item.Updated = now
+			u.maybeRecordHistory(name, item)
 		}
 
 		u.notifyQueueLocked()
@@ -499,6 +507,8 @@ type newStatus struct {
 	Name   string
 	Status ExtractStatus
 	Resp   *xtractr.Response
+	Event  string
+	Note   string
 }
 
 // updateQueueStatus for an on-going tracked extraction.
@@ -513,13 +523,16 @@ func (u *Unpackerr) updateQueueStatus(data *newStatus, now time.Time, sendHook b
 			App:     FolderString,
 			Status:  data.Status,
 			Updated: now,
+			Event:   data.Event,
+			Note:    data.Note,
 			IDs:     map[string]any{"title": data.Name}, // required or webhook may break.
 		}
 
 		u.Map[data.Name].XProg = &ExtractProgress{Extract: u.Map[data.Name]}
+		u.copyFolderExtractLocked(data.Name, u.Map[data.Name])
 
 		if sendHook {
-			u.runAllHooks(u.Map[data.Name])
+			u.queuePendingHook(data.Name, u.Map[data.Name])
 		}
 
 		u.notifyQueueLocked()
@@ -534,14 +547,126 @@ func (u *Unpackerr) updateQueueStatus(data *newStatus, now time.Time, sendHook b
 	u.Map[data.Name].Status = data.Status
 	u.Map[data.Name].Updated = now
 
+	if data.Status != WAITING {
+		u.Map[data.Name].Note = ""
+	}
+
+	u.copyFolderExtractLocked(data.Name, u.Map[data.Name])
+
 	if sendHook {
-		u.runAllHooks(u.Map[data.Name])
+		u.queuePendingHook(data.Name, u.Map[data.Name])
 	}
 
 	u.maybeRecordHistory(data.Name, u.Map[data.Name])
 	u.notifyQueueLocked()
 
 	return u.Map[data.Name]
+}
+
+// copyFolderExtractLocked copies tracker fields the queue/history Extract
+// should own so HTTP snapshots do not read u.folders.Folders. Caller holds
+// History.mu.
+func (u *Unpackerr) copyFolderExtractLocked(name string, item *Extract) {
+	if item == nil || item.App != FolderString || u.folders == nil {
+		return
+	}
+
+	folder, ok := u.folders.Folders[name]
+	if !ok {
+		return
+	}
+
+	item.Retries = folder.Retries
+	item.NoRetry = folder.NoRetry
+
+	if folder.PreFiles != nil {
+		item.PreFiles = folder.PreFiles
+	}
+
+	if folder.Config != nil && folder.Config.DeleteAfter != nil {
+		item.DeleteDelay = folder.Config.DeleteAfter.Duration
+	}
+}
+
+// folderWaitActive reports whether wait_extensions still block extraction.
+// A fresh Updated stamp skips ReadDir while the watcher is still seeing writes.
+func (u *Unpackerr) folderWaitActive(folder *Folder, name string, now time.Time) bool {
+	if folder != nil && folder.WaitFile != "" && now.Sub(folder.Updated) < cleanerInterval+time.Second {
+		return true
+	}
+
+	return u.refreshFolderWait(name)
+}
+
+// refreshFolderWait sets the waiting note from top-level wait_extensions files.
+// Returns true when extraction must stay in WAITING.
+func (u *Unpackerr) refreshFolderWait(name string) bool {
+	if u.folders == nil {
+		return false
+	}
+
+	folder, ok := u.folders.Folders[name]
+	if !ok || folder == nil || folder.Status != WAITING {
+		return false
+	}
+
+	var waitFile string
+	if folder.Config != nil {
+		waitFile = folders.WaitFileInTop(name, folder.Config.WaitExtensions)
+	}
+
+	folder.WaitFile = waitFile
+	u.setFolderWaitNote(name, waitFile)
+
+	return waitFile != ""
+}
+
+func (u *Unpackerr) setFolderWaitNote(name, waitFile string) {
+	u.lockHistory()
+	defer u.unlockHistory()
+
+	item := u.Map[name]
+	if item == nil || item.Status != WAITING {
+		return
+	}
+
+	if item.Note == waitFile {
+		return
+	}
+
+	item.Note = waitFile
+	u.stampQueueDue(name, item)
+
+	if u.hub != nil {
+		u.hub.notifyProgress(u.queueFromExtract(name, item))
+	}
+}
+
+func (u *Unpackerr) folderArchiveCount(name string, folder *Folder) int {
+	cfg := folder.Config
+	if cfg == nil {
+		cfg = &FolderConfig{}
+	}
+
+	found := xtractr.FindCompressedFiles(xtractr.Filter{
+		Path:          name,
+		ExcludeSuffix: folderExcludeSuffixes(cfg),
+		AllowSymlinks: cfg.AllowSymlinks,
+	})
+
+	return found.Count()
+}
+
+func (u *Unpackerr) dropFolderUnqueued(name string) {
+	if u.folders != nil {
+		u.folders.Remove(name)
+		delete(u.folders.Folders, name)
+	}
+
+	u.lockHistory()
+	u.deleteExtract(name)
+	u.notifyQueueLocked()
+	u.unlockHistory()
 }
 
 // copyFolderRetriesLocked writes the folder retry count onto the queue/history

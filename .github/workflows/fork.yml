@@ -12,10 +12,16 @@ on:
         type: string
         default: linux/arm64
   push:
+    branches:
+      - main
     tags:
       - v*
 permissions:
   contents: read
+concurrency:
+  # Newest build wins, so an older commit cannot overwrite the :main tag.
+  group: fork-docker-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   docker:
     if: github.repository != 'Unpackerr/unpackerr'
@@ -50,6 +56,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern=v{{version}}
             type=sha
+            type=ref,event=branch,enable=${{ github.ref == 'refs/heads/main' }}
             type=raw,value=dev,enable=${{ github.event_name == 'workflow_dispatch' }}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
       - name: Build args

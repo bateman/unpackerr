@@ -15,7 +15,8 @@ jobs:
     # description: "Runs `go test` against 3 operating systems."
     strategy:
       matrix:
-        os: [ubuntu, macos, windows]
+        # Fork: Linux only (homelab container). Upstream: [ubuntu, macos, windows]
+        os: [ubuntu]
     runs-on: ${{ matrix.os }}-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -44,6 +45,8 @@ jobs:
       matrix:
         os: [freebsd, darwin]
     name: golangci-lint
+    # Fork: skip freebsd/darwin lint outside upstream (Linux-only container use).
+    if: github.repository == 'Unpackerr/unpackerr'
     runs-on: macos-latest
     env:
       GOOS: ${{ matrix.os }}
@@ -68,7 +71,8 @@ jobs:
     # description: "Runs golangci-lint on linux against linux and windows."
     strategy:
       matrix:
-        os: [linux, windows]
+        # Fork: Linux only (homelab container). Upstream: [linux, windows]
+        os: [linux]
     name: golangci-lint
     runs-on: ubuntu-latest
     env:

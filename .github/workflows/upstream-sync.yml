@@ -1,13 +1,14 @@
 name: upstream-sync
 # Fork-only: weekly merge of Unpackerr/unpackerr main into this fork.
 # Pushes upstream main to the sync/upstream branch, opens (or updates) a PR to main,
-# waits for CI and merges it when green. Conflicts or red CI leave the PR open.
+# waits for CI, merges it when green and deletes the sync branch.
+# Conflicts or red CI leave the PR (and branch) open.
 # Needs the UPSTREAM_SYNC_TOKEN secret: a fine-grained PAT for this repo with
 # Contents, Pull requests and Workflows set to read/write. The default GITHUB_TOKEN
 # cannot push workflow-file changes, and its pushes and PRs do not trigger CI.
 on:
   schedule:
-    - cron: '17 4 * * 1' # Mondays 04:17 UTC
+    - cron: '17 4 * * 5' # Fridays 04:17 UTC
   workflow_dispatch:
 permissions:
   contents: read
@@ -120,3 +121,7 @@ jobs:
           set -euo pipefail
           gh pr merge "${PR}" --merge --match-head-commit "${SHA}" \
             --subject "Merge upstream Unpackerr/unpackerr main (${SHORT})"
+          # Skipped if the repo's "Automatically delete head branches" setting already removed it.
+          if git ls-remote --exit-code --heads origin "${SYNC_BRANCH}" > /dev/null; then
+            git push origin --delete "${SYNC_BRANCH}"
+          fi

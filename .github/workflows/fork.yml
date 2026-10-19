@@ -18,6 +18,10 @@ on:
       - v*
 permissions:
   contents: read
+concurrency:
+  # Newest build wins, so an older commit cannot overwrite the :main tag.
+  group: fork-docker-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   docker:
     if: github.repository != 'Unpackerr/unpackerr'

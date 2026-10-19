@@ -50,13 +50,23 @@ jobs:
             echo "changed=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
-          count="$(git rev-list --count "HEAD..${sha}")"
-          echo "Upstream has ${count} new commit(s), up to ${sha}."
-          git push --force origin "${sha}:refs/heads/${SYNC_BRANCH}"
+          git fetch --no-tags origin "+refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}" 2> /dev/null || true
+          head="$(git rev-parse -q --verify "refs/remotes/origin/${SYNC_BRANCH}" || true)"
+          if [ -n "${head}" ] && git merge-base --is-ancestor "${sha}" "${head}"; then
+            echo "${SYNC_BRANCH} already contains upstream ${sha}."
+          elif git push origin "${sha}:refs/heads/${SYNC_BRANCH}"; then
+            head="${sha}"
+          else
+            # Never force: the branch may carry a conflict fix made on the open PR.
+            echo "::warning::${SYNC_BRANCH} has commits that are not upstream (e.g. a conflict fix); keeping it. Newer upstream commits follow in the next sync."
+          fi
+          synced="$(git merge-base "${head}" "${sha}")"
+          count="$(git rev-list --count "HEAD..${synced}")"
+          echo "Syncing ${count} upstream commit(s), up to ${synced}; PR head ${head}."
           {
             echo "changed=true"
-            echo "sha=${sha}"
-            echo "short=${sha:0:7}"
+            echo "head=${head}"
+            echo "short=${synced:0:7}"
             echo "count=${count}"
           } >> "${GITHUB_OUTPUT}"
       - name: Open or update PR
@@ -74,8 +84,8 @@ jobs:
           if [ -n "${pr}" ]; then
             gh pr edit "${pr}" --title "${title}" --body "${body}"
           else
-            gh pr create --head "${SYNC_BRANCH}" --base "${BASE_BRANCH}" --title "${title}" --body "${body}"
-            pr="$(gh pr list --head "${SYNC_BRANCH}" --base "${BASE_BRANCH}" --state open --json number --jq '.[0].number')"
+            url="$(gh pr create --head "${SYNC_BRANCH}" --base "${BASE_BRANCH}" --title "${title}" --body "${body}")"
+            pr="${url##*/}"
           fi
           echo "PR #${pr}"
           echo "number=${pr}" >> "${GITHUB_OUTPUT}"
@@ -91,11 +101,22 @@ jobs:
             sleep 15
           done
           echo "Mergeable: ${state}"
-          if [ "${state}" != MERGEABLE ]; then
-            gh pr comment "${PR}" --body "upstream-sync: this PR has merge conflicts (\`${state}\`) and needs a manual merge."
-            echo "::error::PR #${PR} is not mergeable (${state}); resolve it manually."
-            exit 1
-          fi
+          case "${state}" in
+            MERGEABLE) ;;
+            CONFLICTING)
+              marker='<!-- upstream-sync:conflict -->'
+              if ! gh pr view "${PR}" --json comments --jq '.comments[].body' | grep -qF "${marker}"; then
+                gh pr comment "${PR}" --body "$(printf '%s\n%s' "${marker}" \
+                  'upstream-sync: this PR has merge conflicts and needs a manual merge. Resolve them on this branch; the next run will not overwrite the fix.')"
+              fi
+              echo "::error::PR #${PR} has merge conflicts; resolve them manually."
+              exit 1
+              ;;
+            *)
+              echo "::error::GitHub has not computed mergeability for PR #${PR} (${state}); re-run later."
+              exit 1
+              ;;
+          esac
       - name: Wait for CI
         if: steps.push.outputs.changed == 'true'
         env:
@@ -105,7 +126,8 @@ jobs:
           # Give the push-triggered workflows time to register their checks.
           sleep 60
           for _ in $(seq 1 20); do
-            gh pr checks "${PR}" --json name --jq 'length' 2>/dev/null | grep -qv '^0$' && break
+            n="$(gh pr checks "${PR}" --json name --jq 'length' 2> /dev/null || true)"
+            [ "${n:-0}" -gt 0 ] && break
             sleep 15
           done
           if ! gh pr checks "${PR}" --watch --interval 30; then
@@ -116,13 +138,10 @@ jobs:
         if: steps.push.outputs.changed == 'true'
         env:
           PR: ${{ steps.pr.outputs.number }}
-          SHA: ${{ steps.push.outputs.sha }}
+          HEAD_SHA: ${{ steps.push.outputs.head }}
           SHORT: ${{ steps.push.outputs.short }}
         run: |
           set -euo pipefail
-          gh pr merge "${PR}" --merge --match-head-commit "${SHA}" \
+          # --delete-branch removes sync/upstream; gh ignores it if GitHub already auto-deleted it.
+          gh pr merge "${PR}" --merge --delete-branch --match-head-commit "${HEAD_SHA}" \
             --subject "Merge upstream Unpackerr/unpackerr main (${SHORT})"
-          # Skipped if the repo's "Automatically delete head branches" setting already removed it.
-          if git ls-remote --exit-code --heads origin "${SYNC_BRANCH}" > /dev/null; then
-            git push origin --delete "${SYNC_BRANCH}"
-          fi

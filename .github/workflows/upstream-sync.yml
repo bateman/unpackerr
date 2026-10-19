@@ -27,6 +27,8 @@ jobs:
       UPSTREAM: https://github.com/Unpackerr/unpackerr.git
       SYNC_BRANCH: sync/upstream
       BASE_BRANCH: main
+      # Checks that must be reported on the PR before it is merged (fail-safe if renamed).
+      REQUIRED_CHECKS: gotest (ubuntu),golangci-lint (linux),integration
     steps:
       - name: Check token
         run: |
@@ -50,21 +52,33 @@ jobs:
             echo "changed=false" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
-          git fetch --no-tags origin "+refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}" 2> /dev/null || true
-          head="$(git rev-parse -q --verify "refs/remotes/origin/${SYNC_BRANCH}" || true)"
+          head=""
+          if git ls-remote --exit-code --heads origin "${SYNC_BRANCH}" > /dev/null; then
+            git fetch --no-tags origin "+refs/heads/${SYNC_BRANCH}:refs/remotes/origin/${SYNC_BRANCH}"
+            head="$(git rev-parse "refs/remotes/origin/${SYNC_BRANCH}")"
+          else
+            rc=$?
+            [ "${rc}" -eq 2 ] || exit "${rc}" # 2 = branch missing; anything else is a real error.
+          fi
+          pushed=false
           if [ -n "${head}" ] && git merge-base --is-ancestor "${sha}" "${head}"; then
             echo "${SYNC_BRANCH} already contains upstream ${sha}."
-          elif git push origin "${sha}:refs/heads/${SYNC_BRANCH}"; then
-            head="${sha}"
+          elif [ -n "${head}" ] && ! git merge-base --is-ancestor "${head}" "${sha}" \
+            && ! git merge-base --is-ancestor "${head}" HEAD; then
+            # Unmerged non-upstream commits, e.g. a conflict fix made on the open PR: never overwrite.
+            echo "::warning::${SYNC_BRANCH} has unmerged commits that are not upstream (e.g. a conflict fix); keeping it. Newer upstream commits follow after it is merged."
           else
-            # Never force: the branch may carry a conflict fix made on the open PR.
-            echo "::warning::${SYNC_BRANCH} has commits that are not upstream (e.g. a conflict fix); keeping it. Newer upstream commits follow in the next sync."
+            # New branch, fast-forward, or a leftover branch already merged into main.
+            git push --force-with-lease="refs/heads/${SYNC_BRANCH}:${head}" origin "${sha}:refs/heads/${SYNC_BRANCH}"
+            head="${sha}"
+            pushed=true
           fi
           synced="$(git merge-base "${head}" "${sha}")"
           count="$(git rev-list --count "HEAD..${synced}")"
           echo "Syncing ${count} upstream commit(s), up to ${synced}; PR head ${head}."
           {
             echo "changed=true"
+            echo "pushed=${pushed}"
             echo "head=${head}"
             echo "short=${synced:0:7}"
             echo "count=${count}"
@@ -73,6 +87,7 @@ jobs:
         id: pr
         if: steps.push.outputs.changed == 'true'
         env:
+          PUSHED: ${{ steps.push.outputs.pushed }}
           SHORT: ${{ steps.push.outputs.short }}
           COUNT: ${{ steps.push.outputs.count }}
         run: |
@@ -81,11 +96,12 @@ jobs:
           body="Automated weekly sync: ${COUNT} new upstream commit(s) from Unpackerr/unpackerr@main, up to ${SHORT}.
           This PR is merged by the upstream-sync workflow once CI is green. It stays open on conflicts or failing CI."
           pr="$(gh pr list --head "${SYNC_BRANCH}" --base "${BASE_BRANCH}" --state open --json number --jq '.[0].number // empty')"
-          if [ -n "${pr}" ]; then
-            gh pr edit "${pr}" --title "${title}" --body "${body}"
-          else
+          if [ -z "${pr}" ]; then
             url="$(gh pr create --head "${SYNC_BRANCH}" --base "${BASE_BRANCH}" --title "${title}" --body "${body}")"
             pr="${url##*/}"
+          elif [ "${PUSHED}" = true ]; then
+            # Only refresh the description when the branch moved, so manual notes on a kept PR survive.
+            gh pr edit "${pr}" --title "${title}" --body "${body}"
           fi
           echo "PR #${pr}"
           echo "number=${pr}" >> "${GITHUB_OUTPUT}"
@@ -93,11 +109,17 @@ jobs:
         if: steps.push.outputs.changed == 'true'
         env:
           PR: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.push.outputs.head }}
         run: |
           set -euo pipefail
+          # Wait until GitHub has seen this run's head and computed mergeability for it.
+          state=UNKNOWN
           for _ in $(seq 1 20); do
-            state="$(gh pr view "${PR}" --json mergeable --jq .mergeable)"
-            [ "${state}" != UNKNOWN ] && break
+            out="$(gh pr view "${PR}" --json headRefOid,mergeable --jq '"\(.headRefOid) \(.mergeable)"')"
+            if [ "${out% *}" = "${HEAD_SHA}" ] && [ "${out#* }" != UNKNOWN ]; then
+              state="${out#* }"
+              break
+            fi
             sleep 15
           done
           echo "Mergeable: ${state}"
@@ -113,7 +135,7 @@ jobs:
               exit 1
               ;;
             *)
-              echo "::error::GitHub has not computed mergeability for PR #${PR} (${state}); re-run later."
+              echo "::error::GitHub has not computed mergeability for PR #${PR} at ${HEAD_SHA}; re-run later."
               exit 1
               ;;
           esac
@@ -121,15 +143,25 @@ jobs:
         if: steps.push.outputs.changed == 'true'
         env:
           PR: ${{ steps.pr.outputs.number }}
+          PUSHED: ${{ steps.push.outputs.pushed }}
         run: |
           set -euo pipefail
           # Give the push-triggered workflows time to register their checks.
-          sleep 60
-          for _ in $(seq 1 20); do
-            n="$(gh pr checks "${PR}" --json name --jq 'length' 2> /dev/null || true)"
-            [ "${n:-0}" -gt 0 ] && break
+          if [ "${PUSHED}" = true ]; then sleep 60; fi
+          IFS=, read -ra required <<< "${REQUIRED_CHECKS}"
+          for _ in $(seq 1 40); do
+            names="$(gh pr checks "${PR}" --json name --jq '.[].name' 2> /dev/null || true)"
+            missing=""
+            for check in "${required[@]}"; do
+              grep -qxF "${check}" <<< "${names}" || missing="${missing}${check}; "
+            done
+            [ -z "${missing}" ] && break
             sleep 15
           done
+          if [ -n "${missing}" ]; then
+            echo "::error::Required checks never appeared on PR #${PR}: ${missing}(update REQUIRED_CHECKS if they were renamed)."
+            exit 1
+          fi
           if ! gh pr checks "${PR}" --watch --interval 30; then
             echo "::error::CI failed on PR #${PR}; leaving it open."
             exit 1

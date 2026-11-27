@@ -72,6 +72,7 @@ services:
     - UN_SONARR_0_DELETE_DELAY=5m
     - UN_SONARR_0_DELETE_ORIG=false
     - UN_SONARR_0_SYNCTHING=false
+    - UN_SONARR_0_SYNCTHING_STALL=30m
     - UN_SONARR_0_VALID_SSL=false
     - UN_SONARR_0_MAX_BYTES=
     ## Radarr Settings
@@ -88,6 +89,7 @@ services:
     - UN_RADARR_0_DELETE_DELAY=5m
     - UN_RADARR_0_DELETE_ORIG=false
     - UN_RADARR_0_SYNCTHING=false
+    - UN_RADARR_0_SYNCTHING_STALL=30m
     - UN_RADARR_0_VALID_SSL=false
     - UN_RADARR_0_MAX_BYTES=
     ## Lidarr Settings
@@ -104,6 +106,7 @@ services:
     - UN_LIDARR_0_DELETE_DELAY=5m
     - UN_LIDARR_0_DELETE_ORIG=false
     - UN_LIDARR_0_SYNCTHING=false
+    - UN_LIDARR_0_SYNCTHING_STALL=30m
     - UN_LIDARR_0_VALID_SSL=false
     - UN_LIDARR_0_MAX_BYTES=
     - UN_LIDARR_0_SPLIT_FLAC=false
@@ -123,6 +126,7 @@ services:
     - UN_READARR_0_DELETE_DELAY=5m
     - UN_READARR_0_DELETE_ORIG=false
     - UN_READARR_0_SYNCTHING=false
+    - UN_READARR_0_SYNCTHING_STALL=30m
     - UN_READARR_0_VALID_SSL=false
     - UN_READARR_0_MAX_BYTES=
     ## Watch Folders
@@ -167,6 +171,7 @@ services:
     - UN_CMDHOOK_0_COMMAND=/downloads/scripts/command.sh
     - UN_CMDHOOK_0_NAME=
     - UN_CMDHOOK_0_SHELL=false
+    - UN_CMDHOOK_0_GATE=false
     - UN_CMDHOOK_0_SILENT=false
     - UN_CMDHOOK_0_EVENTS_0=1
     - UN_CMDHOOK_0_EVENTS_1=4
@@ -175,4 +180,4 @@ services:
     - UN_CMDHOOK_0_EXCLUDE_1=lidarr
     - UN_CMDHOOK_0_TIMEOUT=10s
 
-## => Content Auto Generated, 04 OCT 2026 06:03 UTC
+## => Content Auto Generated, 24 NOV 2026 05:57 UTC

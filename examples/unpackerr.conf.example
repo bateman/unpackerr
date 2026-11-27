@@ -233,6 +233,9 @@ passwords = []
 ## How long to wait for a reply from the backend.
 # timeout = "10s"
 ## How long to wait after import before deleting the extracted items.
+## Set this to -1s to keep those files. Once the app stops listing the
+## download, the item is marked deleted and leaves the queue. Delete
+## originals stays off.
 # delete_delay = "5m"
 ## If you use this app with NZB you may wish to delete archives after extraction.
 ## General recommendation is: do not enable this for torrent use.
@@ -240,6 +243,10 @@ passwords = []
 # delete_orig = false
 ## If you use Syncthing, setting this to true will make unpackerr wait for syncs to finish.
 # syncthing = false
+## How long a Syncthing download may sit unchanged before Unpackerr
+## extracts the files already on disk. An incomplete archive set keeps
+## waiting. Zero uses 30 minutes.
+# syncthing_stall = "30m"
 ## When true, Unpackerr verifies the Starr app HTTPS certificate.
 ## The default is false for backward compatibility.
 # valid_ssl = false
@@ -278,6 +285,9 @@ passwords = []
 ## How long to wait for a reply from the backend.
 # timeout = "10s"
 ## How long to wait after import before deleting the extracted items.
+## Set this to -1s to keep those files. Once the app stops listing the
+## download, the item is marked deleted and leaves the queue. Delete
+## originals stays off.
 # delete_delay = "5m"
 ## If you use this app with NZB you may wish to delete archives after extraction.
 ## General recommendation is: do not enable this for torrent use.
@@ -285,6 +295,10 @@ passwords = []
 # delete_orig = false
 ## If you use Syncthing, setting this to true will make unpackerr wait for syncs to finish.
 # syncthing = false
+## How long a Syncthing download may sit unchanged before Unpackerr
+## extracts the files already on disk. An incomplete archive set keeps
+## waiting. Zero uses 30 minutes.
+# syncthing_stall = "30m"
 ## When true, Unpackerr verifies the Starr app HTTPS certificate.
 ## The default is false for backward compatibility.
 # valid_ssl = false
@@ -323,6 +337,9 @@ passwords = []
 ## How long to wait for a reply from the backend.
 # timeout = "10s"
 ## How long to wait after import before deleting the extracted items.
+## Set this to -1s to keep those files. Once the app stops listing the
+## download, the item is marked deleted and leaves the queue. Delete
+## originals stays off.
 # delete_delay = "5m"
 ## If you use this app with NZB you may wish to delete archives after extraction.
 ## General recommendation is: do not enable this for torrent use.
@@ -330,6 +347,10 @@ passwords = []
 # delete_orig = false
 ## If you use Syncthing, setting this to true will make unpackerr wait for syncs to finish.
 # syncthing = false
+## How long a Syncthing download may sit unchanged before Unpackerr
+## extracts the files already on disk. An incomplete archive set keeps
+## waiting. Zero uses 30 minutes.
+# syncthing_stall = "30m"
 ## When true, Unpackerr verifies the Starr app HTTPS certificate.
 ## The default is false for backward compatibility.
 # valid_ssl = false
@@ -380,6 +401,9 @@ passwords = []
 ## How long to wait for a reply from the backend.
 # timeout = "10s"
 ## How long to wait after import before deleting the extracted items.
+## Set this to -1s to keep those files. Once the app stops listing the
+## download, the item is marked deleted and leaves the queue. Delete
+## originals stays off.
 # delete_delay = "5m"
 ## If you use this app with NZB you may wish to delete archives after extraction.
 ## General recommendation is: do not enable this for torrent use.
@@ -387,6 +411,10 @@ passwords = []
 # delete_orig = false
 ## If you use Syncthing, setting this to true will make unpackerr wait for syncs to finish.
 # syncthing = false
+## How long a Syncthing download may sit unchanged before Unpackerr
+## extracts the files already on disk. An incomplete archive set keeps
+## waiting. Zero uses 30 minutes.
+# syncthing_stall = "30m"
 ## When true, Unpackerr verifies the Starr app HTTPS certificate.
 ## The default is false for backward compatibility.
 # valid_ssl = false
@@ -548,6 +576,13 @@ passwords = []
 # name = ""
 ## Runs the command inside /bin/sh ('nix) or cmd.exe (Windows).
 # shell = false
+## When true, this hook is not an event hook. Unpackerr runs it
+## before queueing a Starr download and waits up to the timeout.
+## Exit 0 means ready. Exit 75 means not yet, and the download is
+## tried again on the next poll. Any other exit, or a timeout, does
+## not hold the download. The first line the command prints is
+## logged when it holds the download or fails.
+# gate = false
 ## Do not log command's output.
 # silent = false
 ## List of event ids to run command for, [0] for all.
@@ -559,4 +594,4 @@ passwords = []
 ## You can adjust how long to wait for the command to run.
 # timeout = "10s"
 
-## => Content Auto Generated, 04 OCT 2026 06:03 UTC
+## => Content Auto Generated, 24 NOV 2026 05:57 UTC

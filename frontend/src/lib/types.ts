@@ -166,6 +166,8 @@ export interface HistoryRecord {
   origFiles?: string[]
   extraFiles?: string[]
   preFiles?: string[]
+  unpacked?: string[]
+  outputFiles?: string[]
   forgotten?: boolean
   ids?: Record<string, unknown>
   event?: 'fsnotify' | 'polling'
@@ -225,7 +227,6 @@ export interface GeneralConfig {
   logQueues: string
   interval: string
   timeout: string
-  deleteDelay: string
   startDelay: string
   retryDelay: string
   progress: string
@@ -275,6 +276,7 @@ export interface StarrConfig {
   delete_orig: boolean
   delete_delay: string
   syncthing: boolean
+  syncthing_stall: string
   valid_ssl: boolean
   timeout: string
   maxBytes: string
@@ -320,6 +322,7 @@ export interface WebhookConfig {
   template: string
   timeout: string
   shell: boolean
+  gate: boolean
   ignoreSsl: boolean
   silent: boolean
   events: (number | string)[]
